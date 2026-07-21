@@ -26,6 +26,16 @@ cargo build --release
 Copy `agent-remote-server` onto the remote host (anywhere on `PATH`, or pass
 its full path with `--remote-bin`).
 
+If the remote's glibc is older than your build machine's, build the server as
+a fully static musl binary instead — it runs anywhere on the same
+architecture:
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl -p agent-remote-server
+# -> target/x86_64-unknown-linux-musl/release/agent-remote-server
+```
+
 ## Quick start
 
 Local mode (`--local`) runs the server as a subprocess -- handy for a single
