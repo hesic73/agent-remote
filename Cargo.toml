@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "crates/agent-remote-protocol",
+    "crates/agent-remote-server",
+    "crates/agent-remote-client",
+    "crates/agent-remote-mcp",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+agent-remote-protocol = { path = "crates/agent-remote-protocol" }
+agent-remote-client = { path = "crates/agent-remote-client" }
+
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+tempfile = "3"
+toml = "0.8"
+anyhow = "1"
+hex = "0.4"
+rmcp = { version = "1", features = ["server", "transport-io"] }
+schemars = "1"
+
+[profile.release]
+lto = "thin"

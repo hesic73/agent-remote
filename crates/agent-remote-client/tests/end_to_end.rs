@@ -1,0 +1,383 @@
+use std::path::{Path, PathBuf};
+
+use agent_remote_client::{Client, Transport};
+use agent_remote_protocol::{ExecEventKind, ListKind};
+
+/// Path to the built agent-remote-server binary.
+fn server_bin() -> PathBuf {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // workspace target dir is two levels up from the crate
+    p.push("../../target/debug/agent-remote-server");
+    p.canonicalize().unwrap_or(p)
+}
+
+struct LocalServerTransport {
+    argv: Vec<String>,
+}
+
+impl Transport for LocalServerTransport {
+    fn spawn(
+        &mut self,
+    ) -> std::io::Result<(
+        tokio::process::Child,
+        tokio::process::ChildStdin,
+        tokio::process::ChildStdout,
+    )> {
+        use std::process::Stdio;
+        use tokio::process::Command;
+        let mut cmd = Command::new(&self.argv[0]);
+        cmd.args(&self.argv[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn()?;
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        Ok((child, stdin, stdout))
+    }
+}
+
+async fn make_client(root: &Path) -> Client {
+    // Ensure the server binary exists; build it if missing.
+    let bin = server_bin();
+    if !bin.exists() {
+        panic!(
+            "server binary not found at {:?}; run `cargo build -p agent-remote-server` first",
+            bin
+        );
+    }
+    let argv = vec![
+        bin.to_string_lossy().into_owned(),
+        "--root".into(),
+        root.to_string_lossy().into_owned(),
+        // Keep server state inside the test tempdir instead of the real HOME.
+        "--log-dir".into(),
+        root.join(".agent-remote-test")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    Client::connect(LocalServerTransport { argv }, None)
+        .await
+        .expect("connect")
+}
+
+#[tokio::test]
+async fn end_to_end_write_read_list_stat() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = make_client(dir.path()).await;
+
+    let w = client
+        .write("src/main.py", "print('hi')\n", None)
+        .await
+        .unwrap();
+    assert!(w.operation_id.starts_with("op-"));
+
+    let r = client.read("src/main.py", None, None).await.unwrap();
+    assert_eq!(r.content, "print('hi')\n");
+    assert!(!r.truncated);
+
+    let entries = client.list("src").await.unwrap();
+    assert!(entries
+        .iter()
+        .any(|e| e.name == "main.py" && e.kind == ListKind::File));
+
+    let s = client.stat("src/main.py").await.unwrap();
+    assert!(s.size > 0);
+}
+
+#[tokio::test]
+async fn end_to_end_patch_with_base_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = make_client(dir.path()).await;
+
+    let w = client.write("f.txt", "a\nb\nc\n", None).await.unwrap();
+    let patched = client.patch("f.txt", &w.new_hash, "2c BEE").await.unwrap();
+    assert_ne!(patched.new_hash, w.new_hash);
+
+    let r = client.read("f.txt", None, None).await.unwrap();
+    assert_eq!(r.content, "a\nBEE\nc\n");
+}
+
+#[tokio::test]
+async fn end_to_end_stale_hash_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = make_client(dir.path()).await;
+    let _ = client.write("f.txt", "v1", None).await.unwrap();
+    // Wrong base hash.
+    let err = client
+        .write("f.txt", "v2", Some("sha256:deadbeef"))
+        .await
+        .unwrap_err();
+    match err {
+        agent_remote_client::ClientError::Server(e) => {
+            assert_eq!(e.code, agent_remote_protocol::ErrorCode::StaleFile);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn end_to_end_exec_streams() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = make_client(dir.path()).await;
+    let mut stdout = String::new();
+    let (code, _op) = client
+        .exec(
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "echo hello; echo err >&2; exit 3".into(),
+            ],
+            None,
+            None,
+            Some(10000),
+            |ev| {
+                if let ExecEventKind::Stdout { data } = &ev {
+                    stdout.push_str(data);
+                }
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 3);
+    assert!(stdout.contains("hello"));
+}
+
+#[tokio::test]
+async fn end_to_end_undo_and_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = make_client(dir.path()).await;
+    let w = client.write("u.txt", "first\n", None).await.unwrap();
+    let _ = client
+        .write("u.txt", "second\n", Some(&w.new_hash))
+        .await
+        .unwrap();
+
+    let history = client.history(None).await.unwrap();
+    assert_eq!(history.len(), 2);
+
+    let target = &history[1];
+    let _ = client.undo(target.operation_id()).await.unwrap();
+    let r = client.read("u.txt", None, None).await.unwrap();
+    assert_eq!(r.content, "first\n");
+}
+
+#[tokio::test]
+async fn end_to_end_status_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = make_client(dir.path()).await;
+    // Unknown.
+    let s = client.request_status("never-existed").await.unwrap();
+    assert_eq!(s.status, agent_remote_protocol::RequestStatus::Unknown);
+
+    // Execute then query.
+    let w = client.write("q.txt", "q", None).await.unwrap();
+    let s = client.request_status("__noop__").await.unwrap();
+    let _ = s;
+    // We don't know the request_id the client generated internally, but we can
+    // still check operation_get works.
+    let d = client.operation_get(&w.operation_id).await.unwrap();
+    assert_eq!(d.record.operation_id(), w.operation_id);
+}
+
+// F3: client must not hang when the connection closes mid-request.
+#[tokio::test]
+async fn client_returns_closed_when_server_dies() {
+    // A transport whose process exits immediately (stdout closes -> EOF). The
+    // client must surface an error, not block forever on its reply channel.
+    struct DeadTransport;
+    impl Transport for DeadTransport {
+        fn spawn(
+            &mut self,
+        ) -> std::io::Result<(
+            tokio::process::Child,
+            tokio::process::ChildStdin,
+            tokio::process::ChildStdout,
+        )> {
+            use std::process::Stdio;
+            use tokio::process::Command;
+            let mut cmd = Command::new("false");
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .kill_on_drop(true);
+            let mut child = cmd.spawn()?;
+            let stdin = child.stdin.take().expect("piped stdin");
+            let stdout = child.stdout.take().expect("piped stdout");
+            Ok((child, stdin, stdout))
+        }
+    }
+
+    let client = Client::connect(DeadTransport, None).await.unwrap();
+    // Give the dead process a moment to exit so the reader observes EOF.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // This request must NOT hang; it should return an error quickly.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read("any.txt", None, None),
+    )
+    .await;
+    match result {
+        Ok(Err(_)) => { /* good: surfaced an error */ }
+        Ok(Ok(_)) => panic!("should not have succeeded against a dead server"),
+        Err(_) => panic!("client hung instead of returning Closed"),
+    }
+}
+
+// F3: exec must not hang when the connection closes mid-stream.
+#[tokio::test]
+async fn client_exec_returns_closed_when_server_dies() {
+    use agent_remote_protocol::ExecEventKind;
+
+    struct DeadTransport;
+    impl Transport for DeadTransport {
+        fn spawn(
+            &mut self,
+        ) -> std::io::Result<(
+            tokio::process::Child,
+            tokio::process::ChildStdin,
+            tokio::process::ChildStdout,
+        )> {
+            use std::process::Stdio;
+            use tokio::process::Command;
+            let mut cmd = Command::new("false");
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .kill_on_drop(true);
+            let mut child = cmd.spawn()?;
+            let stdin = child.stdin.take().expect("piped stdin");
+            let stdout = child.stdout.take().expect("piped stdout");
+            Ok((child, stdin, stdout))
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let client = Client::connect(DeadTransport, None).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.exec(
+            vec!["sleep".into(), "10".into()],
+            None,
+            None,
+            None,
+            |_e: ExecEventKind| {},
+        ),
+    )
+    .await;
+    match result {
+        Ok(Err(_)) => { /* good */ }
+        Ok(Ok(_)) => panic!("exec should not have succeeded against a dead server"),
+        Err(_) => panic!("exec hung instead of returning Closed"),
+    }
+    let _ = dir; // suppress unused
+}
+
+#[tokio::test]
+async fn end_to_end_gc_prunes_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = make_client(dir.path()).await;
+
+    for v in ["1", "2", "3"] {
+        client.write("a.txt", v, None).await.unwrap();
+    }
+    let g = client.gc(Some(1)).await.unwrap();
+    assert_eq!(g.removed_operations, 2);
+    assert_eq!(g.retained_operations, 1);
+
+    let ops = client.history(None).await.unwrap();
+    assert_eq!(ops.len(), 1);
+}
+
+#[tokio::test]
+async fn end_to_end_delete_and_undo() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = make_client(dir.path()).await;
+
+    client.write("d.txt", "precious", None).await.unwrap();
+    let del = client.delete("d.txt").await.unwrap();
+    assert!(!dir.path().join("d.txt").exists());
+    assert_eq!(del.new_hash, "sha256:");
+
+    let u = client.undo(&del.operation_id).await.unwrap();
+    assert_ne!(u.new_hash, "sha256:");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("d.txt")).unwrap(),
+        "precious"
+    );
+}
+
+// Drive the REAL `agent-remote` CLI binary through a stub `ssh` on PATH. The
+// stub mimics real ssh (joins trailing args with spaces, re-parses through a
+// shell), so this exercises the quoted remote-command assembly end to end --
+// with spaces in both the workspace root and the state dir.
+#[tokio::test]
+async fn cli_over_fake_ssh_quotes_paths_with_spaces() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+
+    let stub = tempfile::tempdir().unwrap();
+    let ssh_path = stub.path().join("ssh");
+    std::fs::write(&ssh_path, "#!/bin/sh\nshift\nexec sh -c \"$*\"\n").unwrap();
+    std::fs::set_permissions(&ssh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path_env = format!(
+        "{}:{}",
+        stub.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("my project");
+    std::fs::create_dir(&root).unwrap();
+    let state = base.path().join("st ate");
+
+    let cli = env!("CARGO_BIN_EXE_agent-remote");
+    let srv = server_bin();
+    let common = [
+        "--host".to_string(),
+        "fakehost".to_string(),
+        "--remote-bin".to_string(),
+        srv.to_string_lossy().into_owned(),
+        "--root".to_string(),
+        root.to_string_lossy().into_owned(),
+        "--log-dir".to_string(),
+        state.to_string_lossy().into_owned(),
+    ];
+
+    let mut child = std::process::Command::new(cli)
+        .args(&common)
+        .args(["write", "f.txt"])
+        .env("PATH", &path_env)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello over ssh")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "write over fake ssh failed: {out:?}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("f.txt")).unwrap(),
+        "hello over ssh"
+    );
+
+    let out = std::process::Command::new(cli)
+        .args(&common)
+        .args(["cat", "f.txt"])
+        .env("PATH", &path_env)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "cat over fake ssh failed: {out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello over ssh");
+    // State landed in the (space-containing) state dir, not in the workspace.
+    assert!(state.join("operations.jsonl").exists());
+    assert!(!root.join(".agent-remote").exists());
+}
