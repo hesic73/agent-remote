@@ -62,6 +62,16 @@ impl Transport for ArgvTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        // Die with the parent: if the consumer (CLI/MCP) is killed -- even
+        // with SIGKILL, where no destructor runs -- the transport child must
+        // not outlive it as an orphan holding the remote session (and the
+        // server-side state lock) open.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");

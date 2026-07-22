@@ -175,13 +175,6 @@ impl RemoteWorkspaceServer {
             "cannot reach the remote workspace after {CONNECT_ATTEMPTS} attempts ({last})"
         ))
     }
-
-    /// Eagerly establish the first connection so startup problems (auth,
-    /// wrong paths) show up in the server log instead of only on the first
-    /// tool call. Failure is not fatal: tool calls reconnect on demand.
-    pub async fn warm_up(&self) -> Result<(), String> {
-        self.client().await.map(|_| ())
-    }
 }
 
 #[tool_router]

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use agent_remote_client::{Client, ClientLog, Transport};
+use agent_remote_client::{ArgvTransport, Client, ClientLog};
 use agent_remote_protocol::{ExecEventKind, ListKind};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -125,33 +125,6 @@ fn main() -> Result<()> {
     rt.block_on(async_main_real())
 }
 
-struct LocalTransport {
-    argv: Vec<String>,
-}
-
-impl Transport for LocalTransport {
-    fn spawn(
-        &mut self,
-    ) -> std::io::Result<(
-        tokio::process::Child,
-        tokio::process::ChildStdin,
-        tokio::process::ChildStdout,
-    )> {
-        use std::process::Stdio;
-        use tokio::process::Command;
-        let mut cmd = Command::new(&self.argv[0]);
-        cmd.args(&self.argv[1..])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-        let mut child = cmd.spawn()?;
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
-        Ok((child, stdin, stdout))
-    }
-}
-
 async fn async_main_real() -> Result<()> {
     let cli = Cli::parse();
     let log = match &cli.log {
@@ -187,7 +160,7 @@ async fn async_main_real() -> Result<()> {
         )
     };
 
-    let transport = LocalTransport { argv: server_argv };
+    let transport = ArgvTransport { argv: server_argv };
     let client = Client::connect(transport, log)
         .await
         .context("connect to server")?;

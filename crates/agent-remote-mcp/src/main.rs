@@ -73,12 +73,11 @@ async fn main() -> Result<()> {
         )
     };
 
+    // No eager connect: initialize must answer immediately (a blocking retry
+    // loop here makes the MCP host time the server out, e.g. when a session
+    // being resumed briefly overlaps its predecessor on the same state lock).
+    // The first tool call connects on demand.
     let server = RemoteWorkspaceServer::new(server_argv);
-    // Surface connection problems (auth, wrong paths) in the log immediately,
-    // but keep serving either way: tool calls reconnect on demand.
-    if let Err(e) = server.warm_up().await {
-        tracing::warn!("initial connection failed: {e}");
-    }
     let service = server
         .serve(rmcp::transport::stdio())
         .await
