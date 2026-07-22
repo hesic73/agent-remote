@@ -5,12 +5,18 @@ use agent_remote_protocol::{ErrorCode, ProtocolError};
 #[derive(Clone)]
 pub struct Workspace {
     pub root: PathBuf,
+    pub scratch_root: PathBuf,
 }
 
 impl Workspace {
-    pub fn new(root: PathBuf) -> std::io::Result<Self> {
+    pub fn new(root: PathBuf, scratch_root: PathBuf) -> std::io::Result<Self> {
         let canonical = root.canonicalize()?;
-        Ok(Self { root: canonical })
+        std::fs::create_dir_all(&scratch_root)?;
+        let scratch_root = scratch_root.canonicalize()?;
+        Ok(Self {
+            root: canonical,
+            scratch_root,
+        })
     }
 
     /// Resolve a client-supplied relative path against root, rejecting `..`
@@ -24,7 +30,12 @@ impl Workspace {
             ));
         }
 
-        let raw = Path::new(rel);
+        let (base, relative) = match rel.strip_prefix("@scratch") {
+            Some("") => (&self.scratch_root, "."),
+            Some(rest) if rest.starts_with('/') => (&self.scratch_root, &rest[1..]),
+            _ => (&self.root, rel),
+        };
+        let raw = Path::new(relative);
         if !raw.is_relative() {
             return Err(ProtocolError::new(
                 ErrorCode::PathOutsideRoot,
@@ -52,12 +63,12 @@ impl Workspace {
         // safe: a leaf that does not yet exist (e.g. `escape/new.txt` where
         // `escape` is a symlink out of root) is resolved against the
         // *already-validated* ancestor instead of being accepted unchecked.
-        let joined = self.root.join(raw);
+        let joined = base.join(raw);
         let safe = canonicalize_ancestor(&joined).map_err(|e| {
             ProtocolError::new(ErrorCode::IoError, format!("failed to resolve path: {e}"))
         })?;
 
-        if !safe.starts_with(&self.root) {
+        if !safe.starts_with(base) {
             return Err(ProtocolError::new(
                 ErrorCode::PathOutsideRoot,
                 "resolved path escapes workspace root",
@@ -69,6 +80,14 @@ impl Workspace {
     /// Relative form (posix, forward slashes) of an absolute in-root path, for
     /// reporting in protocol messages.
     pub fn relative(&self, abs: &Path) -> String {
+        if let Ok(path) = abs.strip_prefix(&self.scratch_root) {
+            let path = path.to_string_lossy().replace('\\', "/");
+            return if path.is_empty() {
+                "@scratch".into()
+            } else {
+                format!("@scratch/{path}")
+            };
+        }
         abs.strip_prefix(&self.root)
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default()
@@ -129,6 +148,7 @@ mod tests {
         let dir = tempdir().unwrap();
         Workspace {
             root: dir.path().to_path_buf(),
+            scratch_root: dir.path().join("scratch"),
         }
     }
 
@@ -162,6 +182,31 @@ mod tests {
     }
 
     #[test]
+    fn resolves_scratch_namespace_separately() {
+        let dir = tempdir().unwrap();
+        let scratch = tempdir().unwrap();
+        let w = Workspace {
+            root: dir.path().to_path_buf(),
+            scratch_root: scratch.path().to_path_buf(),
+        };
+        let path = w.resolve("@scratch/logs/test.log").unwrap();
+        assert!(path.starts_with(scratch.path()));
+        assert_eq!(w.relative(&path), "@scratch/logs/test.log");
+    }
+
+    #[test]
+    fn scratch_rejects_parent_escape() {
+        let dir = tempdir().unwrap();
+        let scratch = tempdir().unwrap();
+        let w = Workspace {
+            root: dir.path().to_path_buf(),
+            scratch_root: scratch.path().to_path_buf(),
+        };
+        let err = w.resolve("@scratch/../operations.jsonl").unwrap_err();
+        assert_eq!(err.code, ErrorCode::PathOutsideRoot);
+    }
+
+    #[test]
     fn allows_dot_components() {
         let w = ws();
         let p = w.resolve("./src/./main.py").unwrap();
@@ -176,6 +221,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), dir.path().join("src/escape")).unwrap();
         let w = Workspace {
             root: dir.path().to_path_buf(),
+            scratch_root: dir.path().join("scratch"),
         };
         let err = w.resolve("src/escape").unwrap_err();
         assert_eq!(err.code, ErrorCode::PathOutsideRoot);
@@ -190,6 +236,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
         let w = Workspace {
             root: dir.path().to_path_buf(),
+            scratch_root: dir.path().join("scratch"),
         };
         let err = w.resolve("escape/new.txt").unwrap_err();
         assert_eq!(err.code, ErrorCode::PathOutsideRoot);
@@ -205,6 +252,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         let w = Workspace {
             root: dir.path().to_path_buf(),
+            scratch_root: dir.path().join("scratch"),
         };
         let p = w.resolve("src/new/file.txt").unwrap();
         assert!(p.starts_with(&w.root));
@@ -221,6 +269,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), dir.path().join("a/b/link")).unwrap();
         let w = Workspace {
             root: dir.path().to_path_buf(),
+            scratch_root: dir.path().join("scratch"),
         };
         let err = w.resolve("a/b/link/x").unwrap_err();
         assert_eq!(err.code, ErrorCode::PathOutsideRoot);

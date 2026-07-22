@@ -24,20 +24,16 @@ pub struct FsOperationRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecDisposition {
-    /// The command ran to completion and produced an exit code.
+    /// The command ran to a normal exit or signal termination.
     Completed,
     /// The command was killed because it exceeded timeout_ms. It DID run, so
-    /// duration/captured output are meaningful and a (signal-derived) exit code
-    /// is recorded where available.
+    /// duration and bounded output previews are meaningful.
     TimedOut,
     /// The command was never started, e.g. bad profile, invalid cwd, empty argv.
     Rejected,
 }
 
-/// Authoritative record of an exec invocation: argv, profile, exit code,
-/// duration. Stdout/stderr are intentionally NOT stored inline (they may be
-/// large); they are kept as blobs under `.agent-remote/blobs/<op>.{stdout,stderr}`
-/// when present.
+/// Authoritative record of an exec invocation and its bounded output preview.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecOperationRecord {
     pub operation_id: String,
@@ -51,7 +47,7 @@ pub struct ExecOperationRecord {
     pub timeout_ms: Option<u64>,
     pub disposition: ExecDisposition,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i32>,
+    pub termination: Option<crate::messages::ExecTermination>,
     pub duration_ms: u64,
     pub timestamp_ms: u64,
     /// Human-readable error message for Rejected/TimedOut execs.
@@ -62,10 +58,8 @@ pub struct ExecOperationRecord {
     /// invocation (preserving idempotency semantics).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<crate::error::ErrorCode>,
-    /// True if the captured stdout/stderr blobs were truncated at the
-    /// CAPTURE_LIMIT. Lets a consumer know the blob is not the full output.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_truncated: Option<bool>,
+    pub stdout: crate::messages::ExecOutput,
+    pub stderr: crate::messages::ExecOutput,
 }
 
 /// A "prepared" (write-ahead) marker for an fs mutation, written before the

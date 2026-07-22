@@ -47,8 +47,8 @@ SSH stdin/stdout is the transport: no public IP, no extra port, no daemon. If
 `ssh <host>` works, the connection works, inheriting `~/.ssh/config`,
 ProxyJump, ControlMaster, Tailscale, and the rest.
 
-The protocol is JSON Lines: one message per line, with a `request_id` tying
-together a request, its streamed events, and its final result.
+The protocol is JSON Lines: one request and one terminal response per line,
+correlated by `request_id`.
 
 ## Session semantics
 
@@ -83,7 +83,7 @@ undo  history  operation.get  request.status  gc
 
 ```json
 {"request_id":"r1","op":"read","path":"src/main.py","offset":0,"limit":65536}
-{"request_id":"r1","type":"read","content":"...","hash":"sha256:abc","truncated":false}
+{"request_id":"r1","type":"read","content":"...","hash":"sha256:abc","truncated":true,"next_offset":65536}
 ```
 
 ### Mutations: optimistic concurrency, all-or-nothing
@@ -103,13 +103,12 @@ rejected as a whole.
 
 ```json
 {"request_id":"r3","op":"exec","argv":["pytest","-q"],"cwd":".","profile":"robot","timeout_ms":300000}
-{"request_id":"r3","type":"stdout","data":"collecting...\n"}
-{"request_id":"r3","type":"exit","exit_code":0,"operation_id":"op-43"}
+{"request_id":"r3","type":"exec","operation_id":"op-43","termination":{"kind":"exited","code":0},"duration_ms":842,"stdout":{"prefix":"...","suffix":"","total_bytes":3,"omitted_bytes":0},"stderr":{"prefix":"","suffix":"","total_bytes":0,"omitted_bytes":0}}
 ```
 
-Output streams as events; the exit event carries the exit code. `exec`
-promises no transactionality and no undo -- it can do anything the remote
-user can.
+The result is synchronous and bounded: each stream retains its first 4 KiB and
+last 12 KiB. `exec` promises no transactionality and no undo -- it can do
+anything the remote user can.
 
 ## Undo
 
@@ -128,7 +127,8 @@ the canonical root path:
 ~/.agent-remote/state/<rootname>-<hash>/
 |-- operations.jsonl   one record per operation (fs + exec)
 |-- requests.jsonl     request idempotency table
-|-- blobs/             before-content and exec stdout/stderr
+|-- blobs/             before-content for undo
+|-- scratch/           agent-visible runtime artifacts (`@scratch/...`)
 |-- lock               single-writer flock
 `-- op-counter         id high-water mark (prevents reuse after pruning)
 ```
@@ -179,6 +179,11 @@ containers or user permissions.
 
 ## MCP integration
 
+Operational conventions for agents live only in
+[`AGENT_GUIDANCE.md`](AGENT_GUIDANCE.md); the MCP server embeds that file in
+`ServerInfo.instructions`. This section documents protocol behavior rather
+than duplicating those instructions.
+
 `agent-remote-mcp` wraps the client library in an MCP stdio server, so any
 MCP-capable agent gets the workspace as tools: `list_dir`, `stat`,
 `read_file`, `write_file`, `patch_file`, `delete_file`, `run_command`,
@@ -186,9 +191,12 @@ MCP-capable agent gets the workspace as tools: `list_dir`, `stat`,
 
 * Protocol errors map to MCP `isError` results, so failures are visible to
   the agent.
-* `run_command` output is capped at 16 MiB per stream (UTF-8-safe
-  truncation, dropped bytes reported) so chatty commands cannot grow the
-  response unbounded.
+* `run_command` returns one synchronous terminal result. The server drains both
+  pipes but retains only the first 4 KiB and last 12 KiB of each stream, with
+  total and omitted byte counts. No streaming output path exists.
+* `read_file` returns at most 64 KiB per call; directory listings return at
+  most 1,000 entries with `next_offset`. History defaults to 50 records,
+  rejects limits above 100, and omits exec preview text.
 * In SSH mode the remote command line is shell-quoted per argument, because
   `ssh` re-parses its trailing arguments through the remote shell.
 * Connections are rebuilt on demand: a dead link is replaced on the next
@@ -230,7 +238,7 @@ All criteria are implemented and tested:
 * [x] `list`, `stat`, `read`, `write`, `patch`, `delete`, `exec`
 * [x] All-or-nothing single-file write/patch
 * [x] `read` returns hash; `write`/`patch` accept `base_hash`
-* [x] `exec` streams stdout/stderr and returns the exit code
+* [x] `exec` returns bounded stdout/stderr previews and termination details
 * [x] Operation IDs and fsync'd JSONL log with crash recovery
 * [x] Client interaction log
 * [x] `history` and `operation.get`

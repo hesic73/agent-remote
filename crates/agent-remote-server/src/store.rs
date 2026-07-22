@@ -14,6 +14,7 @@ use tokio::sync::Mutex as AsyncMutex;
 /// Result of a request, stored so that reconnects can query status and
 /// replayed request_ids are not executed twice.
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum StoredResult {
     Done(ServerMessage),
     Error(ProtocolError),
@@ -74,8 +75,7 @@ struct RequestLogLine {
 ///   operations.jsonl   AnyOperationRecord per completed operation
 ///   requests.jsonl     one line per request lifecycle
 ///   blobs/<op>.before  original bytes before an fs mutation (for undo)
-///   blobs/<op>.stdout  captured exec stdout (when present)
-///   blobs/<op>.stderr  captured exec stderr (when present)
+///   scratch/           agent-visible runtime artifacts
 ///
 /// The async `write_lock` serializes all mutating handlers, so the in-memory
 /// tables and the on-disk logs never interleave across concurrent requests.
@@ -608,38 +608,7 @@ impl OperationStore {
         Ok(record)
     }
 
-    pub fn append_exec_record(
-        &self,
-        record: ExecOperationRecord,
-        stdout: Option<&[u8]>,
-        stderr: Option<&[u8]>,
-    ) -> Result<(), ProtocolError> {
-        if let Some(blob) = stdout {
-            if !blob.is_empty() {
-                let p = self
-                    .blobs_dir
-                    .join(format!("{}.stdout", record.operation_id));
-                std::fs::write(&p, blob).map_err(|e| {
-                    ProtocolError::new(ErrorCode::IoError, format!("blob write: {e}"))
-                })?;
-                crate::fsync::fsync_file_or_dir(&p).map_err(|e| {
-                    ProtocolError::new(ErrorCode::IoError, format!("blob fsync: {e}"))
-                })?;
-            }
-        }
-        if let Some(blob) = stderr {
-            if !blob.is_empty() {
-                let p = self
-                    .blobs_dir
-                    .join(format!("{}.stderr", record.operation_id));
-                std::fs::write(&p, blob).map_err(|e| {
-                    ProtocolError::new(ErrorCode::IoError, format!("blob write: {e}"))
-                })?;
-                crate::fsync::fsync_file_or_dir(&p).map_err(|e| {
-                    ProtocolError::new(ErrorCode::IoError, format!("blob fsync: {e}"))
-                })?;
-            }
-        }
+    pub fn append_exec_record(&self, record: ExecOperationRecord) -> Result<(), ProtocolError> {
         self.append_any_record(AnyOperationRecord::Exec(record.clone()))?;
         self.records.lock().push(AnyOperationRecord::Exec(record));
         Ok(())
@@ -647,10 +616,6 @@ impl OperationStore {
 
     pub fn load_before_blob(&self, operation_id: &str) -> Option<Vec<u8>> {
         std::fs::read(self.blobs_dir.join(format!("{operation_id}.before"))).ok()
-    }
-
-    pub fn load_exec_blob(&self, operation_id: &str, stream: &str) -> Option<Vec<u8>> {
-        std::fs::read(self.blobs_dir.join(format!("{operation_id}.{stream}"))).ok()
     }
 
     pub fn find_record(&self, operation_id: &str) -> Option<AnyOperationRecord> {
@@ -744,11 +709,25 @@ impl OperationStore {
                         }
                     }
                     agent_remote_protocol::ExecDisposition::Completed
-                    | agent_remote_protocol::ExecDisposition::TimedOut => ServerMessage::Result {
-                        request_id: e.request_id.clone(),
-                        result: agent_remote_protocol::ResultBody::Exit {
-                            exit_code: e.exit_code.unwrap_or(-1),
-                            operation_id: e.operation_id.clone(),
+                    | agent_remote_protocol::ExecDisposition::TimedOut => match e.termination {
+                        Some(termination) => ServerMessage::Result {
+                            request_id: e.request_id.clone(),
+                            result: agent_remote_protocol::ResultBody::Exec(
+                                agent_remote_protocol::ExecResult {
+                                    operation_id: e.operation_id.clone(),
+                                    termination,
+                                    duration_ms: e.duration_ms,
+                                    stdout: e.stdout.clone(),
+                                    stderr: e.stderr.clone(),
+                                },
+                            ),
+                        },
+                        None => ServerMessage::Error {
+                            request_id: e.request_id.clone(),
+                            error: ProtocolError::new(
+                                ErrorCode::IoError,
+                                "corrupt exec record: completed operation has no termination",
+                            ),
                         },
                     },
                 }
@@ -765,6 +744,16 @@ impl OperationStore {
             if committed.len() > n {
                 let start = committed.len() - n;
                 committed = committed.split_off(start);
+            }
+        }
+        for record in &mut committed {
+            if let AnyOperationRecord::Exec(exec) = record {
+                exec.stdout.prefix.clear();
+                exec.stdout.suffix.clear();
+                exec.stdout.omitted_bytes = exec.stdout.total_bytes;
+                exec.stderr.prefix.clear();
+                exec.stderr.suffix.clear();
+                exec.stderr.omitted_bytes = exec.stderr.total_bytes;
             }
         }
         committed

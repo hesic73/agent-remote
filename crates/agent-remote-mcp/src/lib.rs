@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use agent_remote_client::Client;
-use agent_remote_protocol::{ExecEventKind, ListKind};
+use agent_remote_protocol::ListKind;
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
@@ -11,11 +11,7 @@ use serde::Deserialize;
 
 const SERVER_NAME: &str = "agent-remote-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Per-stream accumulation cap for run_command output (16 MiB). The server
-/// already caps its own captured blobs at 64 MiB; this lower limit keeps the
-/// MCP response from growing unbounded.
-const OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+const AGENT_GUIDANCE: &str = include_str!("../../../AGENT_GUIDANCE.md");
 
 // ---- Helpers ----
 
@@ -31,29 +27,41 @@ fn err(text: impl Into<String>) -> CallToolResult {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListDirInput {
-    #[schemars(description = "Directory path relative to workspace root (e.g. \"src\" or \".\")")]
+    #[schemars(
+        description = "Directory path relative to workspace, or @scratch/... for server-managed scratch"
+    )]
     pub path: String,
+    #[schemars(description = "Entry offset to start at (default: 0)")]
+    pub offset: Option<usize>,
+    #[schemars(description = "Maximum entries to return (default and maximum: 1000)")]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadFileInput {
-    #[schemars(description = "File path relative to workspace root")]
+    #[schemars(
+        description = "File path relative to workspace, or @scratch/... for server-managed scratch"
+    )]
     pub path: String,
     #[schemars(description = "Byte offset to start reading from (default 0)")]
     pub offset: Option<u64>,
-    #[schemars(description = "Maximum bytes to read (default 65536)")]
+    #[schemars(description = "Maximum bytes to read (default and hard maximum: 65536)")]
     pub limit: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct StatInput {
-    #[schemars(description = "File or directory path relative to workspace root")]
+    #[schemars(
+        description = "File or directory path relative to workspace, or @scratch/... for server-managed scratch"
+    )]
     pub path: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WriteFileInput {
-    #[schemars(description = "File path relative to workspace root")]
+    #[schemars(
+        description = "File path relative to workspace, or @scratch/... for server-managed scratch"
+    )]
     pub path: String,
     #[schemars(description = "Full file content to write")]
     pub content: String,
@@ -65,7 +73,9 @@ pub struct WriteFileInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PatchFileInput {
-    #[schemars(description = "File path relative to workspace root")]
+    #[schemars(
+        description = "File path relative to workspace, or @scratch/... for server-managed scratch"
+    )]
     pub path: String,
     #[schemars(description = "Expected current hash (required for optimistic concurrency)")]
     pub base_hash: String,
@@ -75,7 +85,9 @@ pub struct PatchFileInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeleteFileInput {
-    #[schemars(description = "File path relative to workspace root")]
+    #[schemars(
+        description = "File path relative to workspace, or @scratch/... for server-managed scratch"
+    )]
     pub path: String,
 }
 
@@ -83,11 +95,13 @@ pub struct DeleteFileInput {
 pub struct RunCommandInput {
     #[schemars(description = "Command and arguments, e.g. [\"pytest\", \"-q\"]")]
     pub argv: Vec<String>,
-    #[schemars(description = "Working directory relative to root (default: root)")]
+    #[schemars(
+        description = "Working directory relative to workspace, or @scratch/... (default: workspace root)"
+    )]
     pub cwd: Option<String>,
     #[schemars(description = "Environment profile name (configured server-side)")]
     pub profile: Option<String>,
-    #[schemars(description = "Timeout in milliseconds")]
+    #[schemars(description = "Timeout in milliseconds (default: 300000; maximum: 3600000)")]
     pub timeout_ms: Option<u64>,
 }
 
@@ -99,7 +113,7 @@ pub struct UndoInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HistoryInput {
-    #[schemars(description = "Maximum number of operations to return")]
+    #[schemars(description = "Maximum operations to return (default: 50; maximum: 100)")]
     pub limit: Option<usize>,
 }
 
@@ -179,18 +193,23 @@ impl RemoteWorkspaceServer {
     #[tool(description = "List the contents of a directory in the remote workspace.")]
     async fn list_dir(
         &self,
-        Parameters(ListDirInput { path }): Parameters<ListDirInput>,
+        Parameters(ListDirInput {
+            path,
+            offset,
+            limit,
+        }): Parameters<ListDirInput>,
     ) -> CallToolResult {
         let client = match self.client().await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
-        match client.list(&path).await {
-            Ok(entries) => {
-                if entries.is_empty() {
+        match client.list(&path, offset, limit).await {
+            Ok(result) => {
+                if result.entries.is_empty() {
                     return ok("(empty directory)");
                 }
-                let out = entries
+                let mut out = result
+                    .entries
                     .iter()
                     .map(|e| match e.kind {
                         ListKind::Dir => format!("  {}/", e.name),
@@ -202,6 +221,9 @@ impl RemoteWorkspaceServer {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
+                if let Some(next) = result.next_offset {
+                    out.push_str(&format!("\n[more entries: use offset={next}]"));
+                }
                 ok(out)
             }
             Err(e) => err(format!("{e}")),
@@ -226,8 +248,10 @@ impl RemoteWorkspaceServer {
         match client.read(&path, offset, limit).await {
             Ok(r) => {
                 let mut out = r.content;
-                if r.truncated {
-                    out.push_str("\n\n[output truncated; use offset/limit to read more]");
+                if let Some(next) = r.next_offset {
+                    out.push_str(&format!(
+                        "\n\n[output truncated; use offset={next} to read more]"
+                    ));
                 }
                 if let Some(hash) = &r.hash {
                     out.push_str(&format!("\n\n[hash: {hash}]"));
@@ -315,7 +339,7 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Run a command. Returns combined stdout/stderr and exit code. Output is capped; truncated=true if exceeded."
+        description = "Run a command synchronously. Returns termination, duration, and a fixed-size preview of each output stream (first 4 KiB and last 12 KiB). Redirect full output to $AGENT_REMOTE_SCRATCH and read it through @scratch/... when needed."
     )]
     async fn run_command(
         &self,
@@ -330,44 +354,12 @@ impl RemoteWorkspaceServer {
             Ok(c) => c,
             Err(e) => return err(e),
         };
-        let mut stdout = CappedString::new(OUTPUT_LIMIT);
-        let mut stderr = CappedString::new(OUTPUT_LIMIT);
-        let result = client
-            .exec(
-                argv,
-                cwd,
-                profile,
-                timeout_ms,
-                |ev: ExecEventKind| match ev {
-                    ExecEventKind::Stdout { data } => stdout.push_str(&data),
-                    ExecEventKind::Stderr { data } => stderr.push_str(&data),
-                    ExecEventKind::Exit { .. } => {}
-                },
-            )
-            .await;
+        let result = client.exec(argv, cwd, profile, timeout_ms).await;
         match result {
-            Ok((exit_code, op)) => {
-                let mut out = String::new();
-                if !stdout.text.is_empty() {
-                    out.push_str("[stdout]\n");
-                    out.push_str(&stdout.text);
-                }
-                if !stderr.text.is_empty() {
-                    if !out.is_empty() {
-                        out.push('\n');
-                    }
-                    out.push_str("[stderr]\n");
-                    out.push_str(&stderr.text);
-                }
-                if stdout.truncated() || stderr.truncated() {
-                    out.push_str(&format!(
-                        "\n[output truncated: dropped {} stdout bytes, {} stderr bytes]",
-                        stdout.dropped, stderr.dropped
-                    ));
-                }
-                out.push_str(&format!("\n[exit code: {exit_code}] (operation_id: {op})"));
-                ok(out)
-            }
+            Ok(result) => match serde_json::to_string_pretty(&result) {
+                Ok(text) => ok(text),
+                Err(e) => err(format!("could not serialize command result: {e}")),
+            },
             Err(e) => err(format!("{e}")),
         }
     }
@@ -452,117 +444,14 @@ impl RemoteWorkspaceServer {
     }
 }
 
-/// A String that stops growing after `cap` bytes, tracking how many bytes were
-/// dropped. This prevents unbounded memory growth from chatty commands.
-struct CappedString {
-    text: String,
-    cap: usize,
-    dropped: usize,
-}
-
-impl CappedString {
-    fn new(cap: usize) -> Self {
-        Self {
-            text: String::new(),
-            cap,
-            dropped: 0,
-        }
-    }
-
-    fn push_str(&mut self, s: &str) {
-        if self.text.len() >= self.cap {
-            self.dropped += s.len();
-            return;
-        }
-        let remaining = self.cap - self.text.len();
-        if s.len() <= remaining {
-            self.text.push_str(s);
-        } else {
-            // Back off to a char boundary so we never split a UTF-8 sequence.
-            let mut take = remaining;
-            while take > 0 && !s.is_char_boundary(take) {
-                take -= 1;
-            }
-            self.text.push_str(&s[..take]);
-            self.dropped += s.len() - take;
-        }
-    }
-
-    fn truncated(&self) -> bool {
-        self.dropped > 0
-    }
-}
-
 #[tool_handler]
 impl ServerHandler for RemoteWorkspaceServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.server_info.name = SERVER_NAME.into();
         info.server_info.version = SERVER_VERSION.into();
-        info.instructions = Some(
-            "Remote workspace tools for coding agents. All paths are relative to the workspace root."
-                .into(),
-        );
+        info.instructions = Some(AGENT_GUIDANCE.into());
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::CappedString;
-
-    #[test]
-    fn cap_inside_multibyte_char_drops_whole_char() {
-        let mut c = CappedString::new(1);
-        c.push_str("é");
-        assert_eq!(c.text, "");
-        assert_eq!(c.dropped, 2);
-        assert!(c.truncated());
-    }
-
-    #[test]
-    fn cap_at_multibyte_char_end_keeps_it() {
-        let mut c = CappedString::new(2);
-        c.push_str("é");
-        assert_eq!(c.text, "é");
-        assert_eq!(c.dropped, 0);
-        assert!(!c.truncated());
-    }
-
-    #[test]
-    fn cap_splitting_mixed_input_backs_off_to_boundary() {
-        let mut c = CappedString::new(2);
-        c.push_str("aéx");
-        assert_eq!(c.text, "a");
-        assert_eq!(c.dropped, 3);
-        assert!(c.truncated());
-    }
-
-    #[test]
-    fn cap_after_multibyte_char_keeps_prefix() {
-        let mut c = CappedString::new(3);
-        c.push_str("aéx");
-        assert_eq!(c.text, "aé");
-        assert_eq!(c.dropped, 1);
-    }
-
-    #[test]
-    fn pushes_after_full_only_count_dropped() {
-        let mut c = CappedString::new(4);
-        c.push_str("aaaa");
-        c.push_str("éé");
-        assert_eq!(c.text, "aaaa");
-        assert_eq!(c.dropped, 4);
-    }
-
-    #[test]
-    fn under_cap_appends_verbatim() {
-        let mut c = CappedString::new(16);
-        c.push_str("aé");
-        c.push_str("x");
-        assert_eq!(c.text, "aéx");
-        assert_eq!(c.dropped, 0);
-        assert!(!c.truncated());
     }
 }

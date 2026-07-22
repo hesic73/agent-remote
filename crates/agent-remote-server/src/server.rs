@@ -13,6 +13,9 @@ use crate::store::{OperationStore, StoredResult};
 use crate::undo;
 use crate::workspace::Workspace;
 
+const HISTORY_DEFAULT_LIMIT: usize = 50;
+const HISTORY_MAX_LIMIT: usize = 100;
+
 pub struct Server {
     pub workspace: Arc<Workspace>,
     pub store: OperationStore,
@@ -38,7 +41,7 @@ pub struct ServerOptions {
 
 impl Server {
     pub fn new(opts: ServerOptions) -> anyhow::Result<Self> {
-        let workspace = Arc::new(Workspace::new(opts.root)?);
+        let workspace = Arc::new(Workspace::new(opts.root, opts.state_dir.join("scratch"))?);
         let store = OperationStore::new(opts.state_dir).map_err(|e| anyhow::anyhow!(e))?;
         // Run WAL recovery before serving: reconcile any prepared markers left
         // by a crash, and clear requests stuck InProgress so they become retryable.
@@ -195,11 +198,18 @@ impl Server {
         }
 
         match req.body {
-            RequestBody::List { path } => {
-                self.finish(&request_id, fs_ops::list(&self.workspace, &path))
-                    .await
-                    .with_stdout(&stdout)
-                    .await;
+            RequestBody::List {
+                path,
+                offset,
+                limit,
+            } => {
+                self.finish(
+                    &request_id,
+                    fs_ops::list(&self.workspace, &path, offset, limit),
+                )
+                .await
+                .with_stdout(&stdout)
+                .await;
             }
             RequestBody::Stat { path } => {
                 self.finish(&request_id, fs_ops::stat(&self.workspace, &path))
@@ -311,8 +321,18 @@ impl Server {
                     .await;
             }
             RequestBody::History { limit } => {
-                let operations = self.store.history(limit);
-                self.finish(&request_id, Ok(ResultBody::History { operations }))
+                let limit = limit.unwrap_or(HISTORY_DEFAULT_LIMIT);
+                let result = if limit > HISTORY_MAX_LIMIT {
+                    Err(agent_remote_protocol::ProtocolError::new(
+                        ErrorCode::InvalidRequest,
+                        format!("history limit must not exceed {HISTORY_MAX_LIMIT}"),
+                    ))
+                } else {
+                    Ok(ResultBody::History {
+                        operations: self.store.history(Some(limit)),
+                    })
+                };
+                self.finish(&request_id, result)
                     .await
                     .with_stdout(&stdout)
                     .await;
@@ -392,20 +412,6 @@ impl Server {
         let ws = self.workspace.clone();
         let config = self.config.clone();
 
-        let stdout_for_emit = stdout.clone();
-        let rid_emit = request_id.to_string();
-        let emit = move |kind: agent_remote_protocol::ExecEventKind| {
-            let stdout = stdout_for_emit.clone();
-            let rid = rid_emit.clone();
-            async move {
-                let msg = ServerMessage::ExecEvent(agent_remote_protocol::ExecEvent {
-                    request_id: rid,
-                    event: kind,
-                });
-                write_line(&stdout, &msg).await;
-            }
-        };
-
         let outcome = exec::exec(
             &ws,
             &config,
@@ -414,7 +420,6 @@ impl Server {
             &argv,
             timeout_ms,
             operation_id.clone(),
-            emit,
         )
         .await;
 
@@ -423,10 +428,20 @@ impl Server {
                 // disposition reflects what actually happened: Completed if it
                 // ran to an exit code, TimedOut if killed by timeout (but it
                 // DID run, so duration and captured output are meaningful).
-                let disposition = if o.timed_out {
+                let disposition = if matches!(
+                    o.termination,
+                    agent_remote_protocol::ExecTermination::TimedOut
+                ) {
                     agent_remote_protocol::ExecDisposition::TimedOut
                 } else {
                     agent_remote_protocol::ExecDisposition::Completed
+                };
+                let result = agent_remote_protocol::ExecResult {
+                    operation_id: o.operation_id.clone(),
+                    termination: o.termination,
+                    duration_ms: o.duration_ms,
+                    stdout: o.stdout.clone(),
+                    stderr: o.stderr.clone(),
                 };
                 let record = agent_remote_protocol::ExecOperationRecord {
                     operation_id: o.operation_id.clone(),
@@ -434,27 +449,34 @@ impl Server {
                     argv,
                     cwd,
                     profile,
-                    timeout_ms,
+                    timeout_ms: Some(timeout_ms.unwrap_or(exec::DEFAULT_TIMEOUT_MS)),
                     disposition,
-                    exit_code: Some(o.exit_code),
+                    termination: Some(o.termination),
                     duration_ms: o.duration_ms,
                     timestamp_ms: now_ms(),
-                    error: if o.timed_out {
-                        Some(format!("killed after {timeout_ms:?} ms timeout"))
+                    error: if matches!(
+                        o.termination,
+                        agent_remote_protocol::ExecTermination::TimedOut
+                    ) {
+                        Some(format!(
+                            "killed after {} ms timeout",
+                            timeout_ms.unwrap_or(exec::DEFAULT_TIMEOUT_MS)
+                        ))
                     } else {
                         None
                     },
-                    error_code: if o.timed_out {
+                    error_code: if matches!(
+                        o.termination,
+                        agent_remote_protocol::ExecTermination::TimedOut
+                    ) {
                         Some(agent_remote_protocol::ErrorCode::ExecFailed)
                     } else {
                         None
                     },
-                    output_truncated: if o.output_truncated { Some(true) } else { None },
+                    stdout: o.stdout,
+                    stderr: o.stderr,
                 };
-                if let Err(e) =
-                    self.store
-                        .append_exec_record(record, Some(&o.stdout), Some(&o.stderr))
-                {
+                if let Err(e) = self.store.append_exec_record(record) {
                     let _ = self.store.remember_error(request_id, e.clone());
                     write_line(
                         &stdout,
@@ -468,10 +490,7 @@ impl Server {
                 }
                 let body = ServerMessage::Result {
                     request_id: request_id.to_string(),
-                    result: ResultBody::Exit {
-                        exit_code: o.exit_code,
-                        operation_id: o.operation_id,
-                    },
+                    result: ResultBody::Exec(result),
                 };
                 if let Err(log_err) = self.store.remember_result(request_id, body.clone()) {
                     write_line(
@@ -499,14 +518,15 @@ impl Server {
                     profile,
                     timeout_ms,
                     disposition: agent_remote_protocol::ExecDisposition::Rejected,
-                    exit_code: None,
+                    termination: None,
                     duration_ms: 0,
                     timestamp_ms: now_ms(),
                     error: Some(e.message.clone()),
                     error_code: Some(e.code),
-                    output_truncated: None,
+                    stdout: agent_remote_protocol::ExecOutput::default(),
+                    stderr: agent_remote_protocol::ExecOutput::default(),
                 };
-                let record_err = self.store.append_exec_record(record, None, None).err();
+                let record_err = self.store.append_exec_record(record).err();
                 let remember_err = self.store.remember_error(request_id, e.clone()).err();
                 let report = remember_err.or(record_err).unwrap_or(e);
                 write_line(

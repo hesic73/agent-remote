@@ -17,6 +17,10 @@ pub struct Request {
 pub enum RequestBody {
     List {
         path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
     },
     Stat {
         path: String,
@@ -76,6 +80,7 @@ pub enum RequestBody {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum ServerMessage {
     Result {
         request_id: RequestId,
@@ -87,25 +92,21 @@ pub enum ServerMessage {
         #[serde(flatten)]
         error: ProtocolError,
     },
-    ExecEvent(ExecEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ResultBody {
     #[serde(rename = "list")]
-    List { entries: Vec<ListEntry> },
+    List(ListResult),
     #[serde(rename = "stat")]
     Stat { stat: FileEntry },
     #[serde(rename = "read")]
     Read(ReadResult),
     #[serde(rename = "write")]
     WriteOrPatch(WriteOrPatchResult),
-    #[serde(rename = "exit")]
-    Exit {
-        exit_code: i32,
-        operation_id: OperationId,
-    },
+    #[serde(rename = "exec")]
+    Exec(ExecResult),
     #[serde(rename = "undo")]
     Undo(UndoResult),
     #[serde(rename = "history")]
@@ -126,6 +127,13 @@ pub struct ListEntry {
     pub kind: ListKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListResult {
+    pub entries: Vec<ListEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +168,8 @@ pub struct ReadResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
     pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,25 +179,29 @@ pub struct WriteOrPatchResult {
     pub new_hash: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecEvent {
-    pub request_id: RequestId,
-    #[serde(flatten)]
-    pub event: ExecEventKind,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecResult {
+    pub operation_id: OperationId,
+    pub termination: ExecTermination,
+    pub duration_ms: u64,
+    pub stdout: ExecOutput,
+    pub stderr: ExecOutput,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ExecEventKind {
-    #[serde(rename = "stdout")]
-    Stdout { data: String },
-    #[serde(rename = "stderr")]
-    Stderr { data: String },
-    #[serde(rename = "exit")]
-    Exit {
-        exit_code: i32,
-        operation_id: OperationId,
-    },
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecTermination {
+    Exited { code: i32 },
+    TimedOut,
+    Signaled { signal: i32 },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecOutput {
+    pub prefix: String,
+    pub suffix: String,
+    pub total_bytes: u64,
+    pub omitted_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

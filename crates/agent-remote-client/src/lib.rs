@@ -2,9 +2,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use agent_remote_protocol::{
-    ErrorCode, ExecEvent, ExecEventKind, FileEntry, ListEntry, OperationDetails, OperationId,
-    ProtocolError, ReadResult, Request, RequestBody, RequestId, RequestStatusResult, ServerMessage,
-    UndoResult, WriteOrPatchResult,
+    ErrorCode, ExecResult, FileEntry, ListResult, OperationDetails, ProtocolError, ReadResult,
+    Request, RequestBody, RequestId, RequestStatusResult, ServerMessage, UndoResult,
+    WriteOrPatchResult,
 };
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -32,14 +32,11 @@ pub enum ClientError {
 
 type DispMap = Arc<Mutex<std::collections::HashMap<RequestId, oneshot::Sender<ServerMessage>>>>;
 
-type StreamMap = Arc<
-    Mutex<std::collections::HashMap<RequestId, tokio::sync::mpsc::UnboundedSender<ServerMessage>>>,
->;
-
 /// Hard cap on how long a non-streaming request waits for a reply. Guards
 /// against a server that stays connected but never responds. Long-running work
 /// goes through `exec`, which has its own server-side `timeout_ms`.
 const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const DEFAULT_EXEC_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
 /// Spawns the remote process (ssh or local). Implementations return the child
 /// and its stdin/stdout pipes.
@@ -79,43 +76,9 @@ impl Transport for ArgvTransport {
     }
 }
 
-pub struct ExecStream {
-    pub events: tokio::sync::mpsc::UnboundedReceiver<ServerMessage>,
-}
-
-impl ExecStream {
-    /// Collect stdout/stderr/exit into a simple aggregate. Returns (stdout,
-    /// stderr, exit_code, operation_id).
-    pub async fn collect(self) -> (String, String, Option<i32>, Option<OperationId>) {
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        let mut exit = None;
-        let mut op = None;
-        let mut rx = self.events;
-        while let Some(m) = rx.recv().await {
-            match m {
-                ServerMessage::ExecEvent(ExecEvent { event, .. }) => match event {
-                    ExecEventKind::Stdout { data } => stdout.push_str(&data),
-                    ExecEventKind::Stderr { data } => stderr.push_str(&data),
-                    ExecEventKind::Exit {
-                        exit_code,
-                        operation_id,
-                    } => {
-                        exit = Some(exit_code);
-                        op = Some(operation_id);
-                    }
-                },
-                ServerMessage::Result { .. } | ServerMessage::Error { .. } => break,
-            }
-        }
-        (stdout, stderr, exit, op)
-    }
-}
-
 pub struct Client {
     stdin: Arc<Mutex<ChildStdin>>,
     reply_map: DispMap,
-    stream_map: StreamMap,
     /// Persistent close flag: once the transport EOFs, this stays true so any
     /// later request on this Client fails immediately instead of hanging.
     closed: Arc<std::sync::atomic::AtomicBool>,
@@ -134,24 +97,21 @@ impl Client {
         // via the reader task.
         let stdin = Arc::new(Mutex::new(stdin));
         let reply_map: DispMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let stream_map: StreamMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let closed_notify = Arc::new(tokio::sync::Notify::new());
         let log = log.map(Arc::new);
 
         let reader_reply = reply_map.clone();
-        let reader_stream = stream_map.clone();
         let drain_reply = reply_map.clone();
-        let drain_stream = stream_map.clone();
         let reader_closed = closed.clone();
         let reader_notify = closed_notify.clone();
         let reader_log = log.clone();
         tokio::spawn(async move {
-            reader_loop(stdout, reader_reply, reader_stream, reader_log).await;
+            reader_loop(stdout, reader_reply, reader_log).await;
             // Mark the connection persistently closed so future requests on this
             // Client fail fast, then wake any current waiters.
             reader_closed.store(true, std::sync::atomic::Ordering::SeqCst);
-            drain_waiters(&drain_reply, &drain_stream).await;
+            drain_waiters(&drain_reply).await;
             reader_notify.notify_waiters();
             // When stdout ends, the child has exited.
             let _ = _child.wait().await;
@@ -160,7 +120,6 @@ impl Client {
         Ok(Self {
             stdin,
             reply_map,
-            stream_map,
             closed,
             closed_notify,
             log,
@@ -203,6 +162,15 @@ impl Client {
         &self,
         body: RequestBody,
     ) -> Result<(RequestId, ServerMessage), ClientError> {
+        self.send_request_with_timeout(body, DEFAULT_REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn send_request_with_timeout(
+        &self,
+        body: RequestBody,
+        timeout: std::time::Duration,
+    ) -> Result<(RequestId, ServerMessage), ClientError> {
         if self.is_closed() {
             return Err(ClientError::Closed);
         }
@@ -230,7 +198,7 @@ impl Client {
         let msg = tokio::select! {
             biased;
             () = self.wait_closed() => return Err(ClientError::Closed),
-            () = tokio::time::sleep(DEFAULT_REQUEST_TIMEOUT) => {
+            () = tokio::time::sleep(timeout) => {
                 self.reply_map.lock().await.remove(&request_id);
                 return Err(ClientError::Timeout);
             }
@@ -246,19 +214,24 @@ impl Client {
         match msg {
             ServerMessage::Result { result, .. } => Ok(result),
             ServerMessage::Error { error, .. } => Err(ClientError::Server(error)),
-            ServerMessage::ExecEvent(_) => Err(ClientError::Server(ProtocolError::new(
-                ErrorCode::InvalidRequest,
-                "unexpected exec event on reply channel",
-            ))),
         }
     }
 
-    pub async fn list(&self, path: &str) -> Result<Vec<ListEntry>, ClientError> {
+    pub async fn list(
+        &self,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<ListResult, ClientError> {
         let (_, msg) = self
-            .send_request(RequestBody::List { path: path.into() })
+            .send_request(RequestBody::List {
+                path: path.into(),
+                offset,
+                limit,
+            })
             .await?;
         match Self::unpack(msg)? {
-            agent_remote_protocol::ResultBody::List { entries } => Ok(entries),
+            agent_remote_protocol::ResultBody::List(result) => Ok(result),
             _ => Err(ClientError::Server(ProtocolError::new(
                 ErrorCode::InvalidRequest,
                 "unexpected result body for list",
@@ -358,91 +331,36 @@ impl Client {
         }
     }
 
-    /// Run an exec, streaming events. The callback is invoked for each
-    /// stdout/stderr/exit event. Returns the final exit code and operation id.
-    pub async fn exec<F>(
+    /// Run a command synchronously and return its bounded output preview.
+    pub async fn exec(
         &self,
         argv: Vec<String>,
         cwd: Option<String>,
         profile: Option<String>,
         timeout_ms: Option<u64>,
-        mut on_event: F,
-    ) -> Result<(i32, OperationId), ClientError>
-    where
-        F: FnMut(ExecEventKind),
-    {
-        if self.is_closed() {
-            return Err(ClientError::Closed);
-        }
-        let request_id = self.next_request_id();
-        let req = Request {
-            request_id: request_id.clone(),
-            body: RequestBody::Exec {
-                argv,
-                cwd,
-                profile,
-                timeout_ms,
-            },
-        };
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
-        self.stream_map.lock().await.insert(request_id.clone(), tx);
-        let line = serde_json::to_string(&req)?;
-        if let Some(l) = &self.log {
-            l.log_request(&request_id, &line).await;
-        }
-        {
-            let mut w = self.stdin.lock().await;
-            w.write_all(line.as_bytes()).await?;
-            w.write_all(b"\n").await?;
-            w.flush().await?;
-        }
-
-        let mut exit_code = None;
-        let mut op_id = None;
-        loop {
-            // Abort promptly if the connection drops mid-exec.
-            let m = tokio::select! {
-                biased;
-                () = self.wait_closed() => {
-                    self.stream_map.lock().await.remove(&request_id);
-                    return Err(ClientError::Closed);
-                }
-                m = rx.recv() => match m {
-                    Some(m) => m,
-                    None => {
-                        self.stream_map.lock().await.remove(&request_id);
-                        return Err(ClientError::Closed);
-                    }
+    ) -> Result<ExecResult, ClientError> {
+        let wait = std::time::Duration::from_millis(
+            timeout_ms
+                .unwrap_or(DEFAULT_EXEC_TIMEOUT_MS)
+                .saturating_add(30_000),
+        );
+        let (_, msg) = self
+            .send_request_with_timeout(
+                RequestBody::Exec {
+                    argv,
+                    cwd,
+                    profile,
+                    timeout_ms,
                 },
-            };
-            if let Some(l) = &self.log {
-                l.log_response(&request_id, &m).await;
-            }
-            match m {
-                ServerMessage::ExecEvent(ExecEvent { event, .. }) => {
-                    on_event(event);
-                }
-                ServerMessage::Result { result, .. } => {
-                    if let agent_remote_protocol::ResultBody::Exit {
-                        exit_code: c,
-                        operation_id,
-                    } = result
-                    {
-                        exit_code = Some(c);
-                        op_id = Some(operation_id);
-                    }
-                    break;
-                }
-                ServerMessage::Error { error, .. } => {
-                    self.stream_map.lock().await.remove(&request_id);
-                    return Err(ClientError::Server(error));
-                }
-            }
-        }
-        self.stream_map.lock().await.remove(&request_id);
-        match (exit_code, op_id) {
-            (Some(c), Some(o)) => Ok((c, o)),
-            _ => Err(ClientError::Closed),
+                wait,
+            )
+            .await?;
+        match Self::unpack(msg)? {
+            agent_remote_protocol::ResultBody::Exec(result) => Ok(result),
+            _ => Err(ClientError::Server(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "unexpected result body for exec",
+            ))),
         }
     }
 
@@ -521,20 +439,12 @@ impl Client {
 }
 
 /// On connection close, fail every waiter by removing and dropping their
-/// senders. oneshot senders signal an error on drop, and stream senders cause
-/// `recv()` to return None, so both ordinary and streaming requests wake up
-/// and surface ClientError::Closed instead of hanging forever.
-async fn drain_waiters(reply_map: &DispMap, stream_map: &StreamMap) {
+/// senders. Dropping a oneshot sender wakes the request with Closed.
+async fn drain_waiters(reply_map: &DispMap) {
     reply_map.lock().await.clear();
-    stream_map.lock().await.clear();
 }
 
-async fn reader_loop(
-    stdout: ChildStdout,
-    reply_map: DispMap,
-    stream_map: StreamMap,
-    log: Option<Arc<ClientLog>>,
-) {
+async fn reader_loop(stdout: ChildStdout, reply_map: DispMap, log: Option<Arc<ClientLog>>) {
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     loop {
@@ -562,28 +472,11 @@ async fn reader_loop(
             ServerMessage::Result { request_id, .. } | ServerMessage::Error { request_id, .. } => {
                 request_id.clone()
             }
-            ServerMessage::ExecEvent(e) => e.request_id.clone(),
         };
         if let Some(l) = &log {
             l.log_raw(&rid, trimmed).await;
         }
         debug!(request_id = %rid, "recv");
-        let is_terminal = matches!(
-            &msg,
-            ServerMessage::Result { .. } | ServerMessage::Error { .. }
-        );
-        // Exec streams are routed by request_id across multiple messages, so
-        // keep the entry until the terminal message arrives.
-        let stream_tx_present = { stream_map.lock().await.contains_key(&rid) };
-        if stream_tx_present {
-            if let Some(tx) = { stream_map.lock().await.get(&rid).cloned() } {
-                let _ = tx.send(msg);
-            }
-            if is_terminal {
-                stream_map.lock().await.remove(&rid);
-            }
-            continue;
-        }
         let reply_tx = { reply_map.lock().await.remove(&rid) };
         if let Some(tx) = reply_tx {
             let _ = tx.send(msg);

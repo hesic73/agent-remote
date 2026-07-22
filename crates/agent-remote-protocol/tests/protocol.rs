@@ -12,7 +12,11 @@ fn round_trip(req: &Request) -> Request {
 fn list_round_trips() {
     let req = Request {
         request_id: "r1".into(),
-        body: RequestBody::List { path: "src".into() },
+        body: RequestBody::List {
+            path: "src".into(),
+            offset: None,
+            limit: None,
+        },
     };
     let line = serde_json::to_string(&req).unwrap();
     assert_eq!(line, r#"{"request_id":"r1","op":"list","path":"src"}"#);
@@ -98,6 +102,7 @@ fn result_message_serializes() {
             content: "...".into(),
             hash: Some("sha256:abc123".into()),
             truncated: false,
+            next_offset: None,
         }),
     };
     let line = serde_json::to_string(&msg).unwrap();
@@ -125,30 +130,29 @@ fn error_message_serializes_with_hashes() {
 }
 
 #[test]
-fn exec_event_messages() {
-    let stdout = ServerMessage::ExecEvent(ExecEvent {
+fn exec_result_message() {
+    let result = ServerMessage::Result {
         request_id: "r4".into(),
-        event: ExecEventKind::Stdout {
-            data: "collecting tests...\n".into(),
-        },
-    });
-    let line = serde_json::to_string(&stdout).unwrap();
-    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-    assert_eq!(v["type"], "stdout");
-    assert_eq!(v["data"], "collecting tests...\n");
-
-    let exit = ServerMessage::ExecEvent(ExecEvent {
-        request_id: "r4".into(),
-        event: ExecEventKind::Exit {
-            exit_code: 0,
+        result: ResultBody::Exec(ExecResult {
             operation_id: "op-43".into(),
-        },
-    });
-    let line = serde_json::to_string(&exit).unwrap();
+            termination: ExecTermination::Exited { code: 0 },
+            duration_ms: 12,
+            stdout: ExecOutput {
+                prefix: "collecting tests...\n".into(),
+                suffix: String::new(),
+                total_bytes: 20,
+                omitted_bytes: 0,
+            },
+            stderr: ExecOutput::default(),
+        }),
+    };
+    let line = serde_json::to_string(&result).unwrap();
     let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-    assert_eq!(v["type"], "exit");
-    assert_eq!(v["exit_code"], 0);
+    assert_eq!(v["type"], "exec");
+    assert_eq!(v["termination"]["kind"], "exited");
+    assert_eq!(v["termination"]["code"], 0);
     assert_eq!(v["operation_id"], "op-43");
+    assert_eq!(v["stdout"]["prefix"], "collecting tests...\n");
 }
 
 #[test]
@@ -220,7 +224,10 @@ fn every_result_variant_round_trips_through_server_message() {
     // any other duplicate) breaks serialization. Build each variant and verify
     // it round-trips.
     let cases: Vec<ResultBody> = vec![
-        ResultBody::List { entries: vec![] },
+        ResultBody::List(ListResult {
+            entries: vec![],
+            next_offset: None,
+        }),
         ResultBody::Stat {
             stat: FileEntry {
                 path: "x".into(),
@@ -234,16 +241,20 @@ fn every_result_variant_round_trips_through_server_message() {
             content: "c".into(),
             hash: None,
             truncated: false,
+            next_offset: None,
         }),
         ResultBody::WriteOrPatch(WriteOrPatchResult {
             operation_id: "op-1".into(),
             old_hash: None,
             new_hash: "sha256:x".into(),
         }),
-        ResultBody::Exit {
-            exit_code: 0,
+        ResultBody::Exec(ExecResult {
             operation_id: "op-2".into(),
-        },
+            termination: ExecTermination::Exited { code: 0 },
+            duration_ms: 1,
+            stdout: ExecOutput::default(),
+            stderr: ExecOutput::default(),
+        }),
         ResultBody::Undo(UndoResult {
             operation_id: "op-3".into(),
             restored_hash: None,

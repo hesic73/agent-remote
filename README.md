@@ -76,7 +76,7 @@ source /opt/ros/humble/setup.bash
 
 | Command | Purpose |
 |---------|---------|
-| `ls <path>` | List a directory |
+| `ls <path> [--offset N] [--limit N]` | List a directory |
 | `stat <path>` | Stat a file or directory |
 | `cat <path> [--offset N] [--limit N]` | Read a file |
 | `write <path> [--file F] [--base-hash H]` | Write content (file or stdin) |
@@ -136,6 +136,10 @@ Conflicting or out-of-range edits are rejected and the file is left untouched.
 
 ## MCP server (use from a coding agent)
 
+Agent-facing conventions have a single canonical source in
+[`AGENT_GUIDANCE.md`](AGENT_GUIDANCE.md). The MCP server embeds that file
+verbatim in its initialization instructions.
+
 `agent-remote-mcp` exposes the same operations as MCP tools over stdio:
 
 ```bash
@@ -153,9 +157,13 @@ Tools: `list_dir`, `stat`, `read_file`, `write_file`, `patch_file`,
 `delete_file`, `run_command`, `undo`, `history`, `operation_get`,
 `request_status`. Flags mirror the CLI.
 
-Tool failures come back as MCP `isError` results. `run_command` output is
-capped at 16 MiB per stream (UTF-8-safe truncation, dropped bytes reported),
-so chatty commands cannot blow up the agent's context.
+Tool failures come back as MCP `isError` results. `run_command` is synchronous
+and returns a server-bounded preview for each stream: the first 4 KiB and last
+12 KiB, together with byte counts and termination details. Full logs belong in
+the server-managed `@scratch/...` namespace and can be paged with `read_file`.
+Reads are limited to 64 KiB per call. Directory listings return at most 1,000
+entries with `next_offset`. History defaults to 50 records, has a hard maximum
+of 100, and omits stored exec preview text.
 
 The connection is resilient: if the SSH link dies (network blip, sshd
 resetting the connection), the next tool call reconnects automatically with
@@ -166,8 +174,9 @@ cannot leave an orphaned connection holding the remote state lock.
 
 ## Guarantees
 
-- **Workspace boundary.** Paths resolve inside `--root`; `..`, absolute
-  paths, and symlinks escaping the root are rejected. Guards against
+- **File boundary.** Normal paths resolve inside `--root`; `@scratch/...`
+  resolves inside a separate server-managed scratch root. `..`, absolute
+  paths, and symlinks escaping either root are rejected. Guards against
   accidents, not adversaries -- `exec` can still touch anything the user can.
 - **Atomic writes.** `write`/`patch` build the full result, then atomically
   rename into place, preserving file mode. A failed patch changes nothing.
@@ -175,7 +184,7 @@ cannot leave an orphaned connection holding the remote state lock.
   with `STALE_FILE` if the file changed; `read` returns a hash usable
   directly as the next `base_hash`.
 - **Durable, recoverable log.** Every operation is recorded in fsync'd JSONL
-  with before/after hashes and stdout/stderr blobs. Mutations are
+  with before/after hashes or bounded exec output previews. Mutations are
   write-ahead (`prepared`/`committed`), and startup recovery reconciles a
   crash between rename and commit.
 - **Safe undo.** Only applies while the file is still in the recorded
@@ -201,7 +210,7 @@ crates/
 ```
 
 ```bash
-cargo test --workspace --all-targets   # 124 tests, incl. end-to-end against
+cargo test --workspace --all-targets   # includes end-to-end tests against
                                        # the real server and MCP binaries
 cargo clippy --workspace --all-targets -- -D warnings
 ```

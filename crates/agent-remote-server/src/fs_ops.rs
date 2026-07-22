@@ -11,7 +11,23 @@ use crate::patch::apply_patch;
 use crate::store::OperationStore;
 use crate::workspace::Workspace;
 
-pub fn list(ws: &Workspace, path: &str) -> Result<ResultBody, ProtocolError> {
+pub const LIST_DEFAULT_LIMIT: usize = 1000;
+pub const LIST_MAX_LIMIT: usize = 1000;
+
+pub fn list(
+    ws: &Workspace,
+    path: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<ResultBody, ProtocolError> {
+    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(LIST_DEFAULT_LIMIT);
+    if limit == 0 || limit > LIST_MAX_LIMIT {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("list limit must be between 1 and {LIST_MAX_LIMIT} entries"),
+        ));
+    }
     let abs = ws.resolve(path)?;
     let meta = std::fs::symlink_metadata(&abs).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -39,7 +55,16 @@ pub fn list(ws: &Workspace, path: &str) -> Result<ResultBody, ProtocolError> {
         .filter(|e| e.name != ".agent-remote")
         .collect();
     entries.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(ResultBody::List { entries })
+    let end = offset.saturating_add(limit).min(entries.len());
+    let page = if offset >= entries.len() {
+        Vec::new()
+    } else {
+        entries[offset..end].to_vec()
+    };
+    Ok(ResultBody::List(agent_remote_protocol::ListResult {
+        entries: page,
+        next_offset: (end < entries.len()).then_some(end),
+    }))
 }
 
 pub fn stat(ws: &Workspace, path: &str) -> Result<ResultBody, ProtocolError> {
@@ -51,7 +76,7 @@ pub fn stat(ws: &Workspace, path: &str) -> Result<ResultBody, ProtocolError> {
             ProtocolError::new(ErrorCode::IoError, format!("stat failed: {e}"))
         }
     })?;
-    let entry = entry_for(&abs, &meta);
+    let entry = entry_for(path, &abs, &meta);
     Ok(ResultBody::Stat { stat: entry })
 }
 
@@ -93,7 +118,13 @@ pub fn read(
     // a bad request can never crash the handler. Use checked arithmetic so huge
     // values cannot overflow.
     let offset_u64 = offset.unwrap_or(0);
-    let limit_u64 = limit.unwrap_or(READ_DEFAULT_LIMIT).min(READ_MAX_LIMIT);
+    let limit_u64 = limit.unwrap_or(READ_DEFAULT_LIMIT);
+    if limit_u64 == 0 || limit_u64 > READ_MAX_LIMIT {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("read limit must be between 1 and {READ_MAX_LIMIT} bytes"),
+        ));
+    }
     if offset_u64 > full_content.len() as u64 {
         return Err(ProtocolError::new(
             ErrorCode::InvalidRequest,
@@ -130,11 +161,12 @@ pub fn read(
         content,
         hash: Some(full_hash),
         truncated,
+        next_offset: truncated.then_some(end as u64),
     }))
 }
 
 pub const READ_DEFAULT_LIMIT: u64 = 65536;
-pub const READ_MAX_LIMIT: u64 = 4 * 1024 * 1024;
+pub const READ_MAX_LIMIT: u64 = 64 * 1024;
 
 /// Validate base_hash and return the current hash. If `base_hash` is given and
 /// does not match the file's current content, returns StaleFile.
@@ -366,7 +398,7 @@ fn file_kind(path: &Path) -> ListKind {
     }
 }
 
-fn entry_for(abs: &Path, meta: &std::fs::Metadata) -> FileEntry {
+fn entry_for(client_path: &str, abs: &Path, meta: &std::fs::Metadata) -> FileEntry {
     use std::os::unix::fs::PermissionsExt;
     let kind = if meta.file_type().is_symlink() {
         ListKind::Symlink
@@ -377,7 +409,7 @@ fn entry_for(abs: &Path, meta: &std::fs::Metadata) -> FileEntry {
     };
     let mode = meta.permissions().mode();
     FileEntry {
-        path: abs.to_string_lossy().to_string(),
+        path: client_path.to_string(),
         kind,
         size: meta.len(),
         hash: if meta.is_file() {
@@ -415,6 +447,7 @@ mod read_tests {
         std::fs::write(dir.path().join(path), content).unwrap();
         let w = Workspace {
             root: dir.path().to_path_buf(),
+            scratch_root: dir.path().join("scratch"),
         };
         (dir, w)
     }
@@ -455,6 +488,7 @@ mod read_tests {
             ResultBody::Read(r) => {
                 assert_eq!(r.content, "aé");
                 assert!(r.truncated, "more content remains");
+                assert_eq!(r.next_offset, Some(3));
             }
             _ => panic!("wrong body"),
         }
@@ -466,6 +500,19 @@ mod read_tests {
         let res = read(&w, "f.txt", Some(u64::MAX), Some(u64::MAX));
         assert!(matches!(
             res,
+            Err(ProtocolError {
+                code: ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn read_rejects_limit_above_hard_maximum() {
+        let (_d, w) = ws_with("f.txt", "hi");
+        let result = read(&w, "f.txt", None, Some(READ_MAX_LIMIT + 1));
+        assert!(matches!(
+            result,
             Err(ProtocolError {
                 code: ErrorCode::InvalidRequest,
                 ..

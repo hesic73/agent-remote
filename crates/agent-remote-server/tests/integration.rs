@@ -170,7 +170,6 @@ impl Harness {
                 | ServerMessage::Error {
                     request_id: rid, ..
                 } => rid == request_id,
-                ServerMessage::ExecEvent(e) => e.request_id == request_id,
             };
             if belongs {
                 out.push(m);
@@ -251,11 +250,18 @@ async fn list_and_stat() {
     std::fs::create_dir_all(h.root_path.join("sub")).unwrap();
     std::fs::write(h.root_path.join("sub/b.txt"), "bbb").unwrap();
 
-    h.send(&req("l", RequestBody::List { path: ".".into() }));
+    h.send(&req(
+        "l",
+        RequestBody::List {
+            path: ".".into(),
+            offset: None,
+            limit: None,
+        },
+    ));
     let m = h.recv().await;
     match m {
         ServerMessage::Result {
-            result: ResultBody::List { entries },
+            result: ResultBody::List(ListResult { entries, .. }),
             ..
         } => {
             let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -284,6 +290,50 @@ async fn list_and_stat() {
         }
         other => panic!("unexpected: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn list_is_paginated_and_bounded() {
+    let mut h = harness().await;
+    for name in ["a", "b", "c"] {
+        std::fs::write(h.root_path.join(name), name).unwrap();
+    }
+    h.send(&req(
+        "l1",
+        RequestBody::List {
+            path: ".".into(),
+            offset: None,
+            limit: Some(2),
+        },
+    ));
+    let next = match h.recv().await {
+        ServerMessage::Result {
+            result: ResultBody::List(result),
+            ..
+        } => {
+            assert_eq!(result.entries.len(), 2);
+            result.next_offset.expect("second page")
+        }
+        other => panic!("unexpected: {other:?}"),
+    };
+    h.send(&req(
+        "l2",
+        RequestBody::List {
+            path: ".".into(),
+            offset: Some(next),
+            limit: Some(2),
+        },
+    ));
+    assert!(matches!(
+        h.recv().await,
+        ServerMessage::Result {
+            result: ResultBody::List(ListResult {
+                entries,
+                next_offset: None,
+            }),
+            ..
+        } if entries.len() == 1
+    ));
 }
 
 #[tokio::test]
@@ -435,7 +485,7 @@ async fn path_boundary_rejects_escape() {
 }
 
 #[tokio::test]
-async fn exec_streams_and_exits() {
+async fn exec_returns_stdout_and_exit() {
     let mut h = harness().await;
     h.send(&req(
         "e",
@@ -447,28 +497,17 @@ async fn exec_streams_and_exits() {
         },
     ));
     let msgs = h.recv_all_for("e").await;
-    let mut saw_stdout = false;
-    let mut exit_code = None;
-    for m in &msgs {
-        match m {
-            ServerMessage::ExecEvent(ExecEvent {
-                event: ExecEventKind::Stdout { data },
+    assert!(matches!(
+        &msgs[0],
+        ServerMessage::Result {
+            result: ResultBody::Exec(ExecResult {
+                termination: ExecTermination::Exited { code: 0 },
+                stdout,
                 ..
-            }) => {
-                assert!(data.contains("hello-stdout"));
-                saw_stdout = true;
-            }
-            ServerMessage::Result {
-                result: ResultBody::Exit { exit_code: c, .. },
-                ..
-            } => {
-                exit_code = Some(*c);
-            }
-            _ => {}
-        }
-    }
-    assert!(saw_stdout, "should have seen stdout");
-    assert_eq!(exit_code, Some(0));
+            }),
+            ..
+        } if stdout.prefix.contains("hello-stdout")
+    ));
 }
 
 #[tokio::test]
@@ -484,26 +523,125 @@ async fn exec_nonzero_exit_and_stderr() {
         },
     ));
     let msgs = h.recv_all_for("e").await;
-    let mut saw_stderr = false;
-    let mut exit_code = None;
-    for m in &msgs {
-        match m {
-            ServerMessage::ExecEvent(ExecEvent {
-                event: ExecEventKind::Stderr { data },
+    assert!(matches!(
+        &msgs[0],
+        ServerMessage::Result {
+            result: ResultBody::Exec(ExecResult {
+                termination: ExecTermination::Exited { code: 7 },
+                stderr,
                 ..
-            }) => {
-                assert!(data.contains("err"));
-                saw_stderr = true;
-            }
-            ServerMessage::Result {
-                result: ResultBody::Exit { exit_code: c, .. },
-                ..
-            } => exit_code = Some(*c),
-            _ => {}
+            }),
+            ..
+        } if stderr.prefix.contains("err")
+    ));
+}
+
+#[tokio::test]
+async fn exec_output_is_bounded_with_prefix_and_suffix() {
+    let mut h = harness().await;
+    h.send(&req(
+        "e",
+        RequestBody::Exec {
+            argv: vec![
+                "python3".into(),
+                "-c".into(),
+                "import sys; sys.stdout.write('A' * 5000 + 'B' * 13000)".into(),
+            ],
+            cwd: None,
+            profile: None,
+            timeout_ms: Some(10000),
+        },
+    ));
+    let msgs = h.recv_all_for("e").await;
+    match &msgs[0] {
+        ServerMessage::Result {
+            result: ResultBody::Exec(result),
+            ..
+        } => {
+            assert_eq!(result.stdout.prefix.len(), 4 * 1024);
+            assert_eq!(result.stdout.suffix.len(), 12 * 1024);
+            assert!(result.stdout.prefix.bytes().all(|b| b == b'A'));
+            assert!(result.stdout.suffix.bytes().all(|b| b == b'B'));
+            assert_eq!(result.stdout.total_bytes, 18_000);
+            assert_eq!(result.stdout.omitted_bytes, 18_000 - 16 * 1024);
         }
+        other => panic!("unexpected: {other:?}"),
     }
-    assert!(saw_stderr);
-    assert_eq!(exit_code, Some(7));
+}
+
+#[tokio::test]
+async fn scratch_is_shared_by_exec_and_file_tools() {
+    let mut h = harness().await;
+    h.send(&req(
+        "e",
+        RequestBody::Exec {
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf scratch-data > \"$AGENT_REMOTE_SCRATCH/job.log\"".into(),
+            ],
+            cwd: None,
+            profile: None,
+            timeout_ms: Some(10000),
+        },
+    ));
+    let _ = h.recv_all_for("e").await;
+
+    h.send(&req(
+        "r",
+        RequestBody::Read {
+            path: "@scratch/job.log".into(),
+            offset: None,
+            limit: None,
+        },
+    ));
+    assert!(matches!(
+        h.recv().await,
+        ServerMessage::Result {
+            result: ResultBody::Read(ReadResult { content, .. }),
+            ..
+        } if content == "scratch-data"
+    ));
+}
+
+#[tokio::test]
+async fn exec_rejects_timeout_above_hard_limit() {
+    let mut h = harness().await;
+    h.send(&req(
+        "e",
+        RequestBody::Exec {
+            argv: vec!["true".into()],
+            cwd: None,
+            profile: None,
+            timeout_ms: Some(60 * 60 * 1000 + 1),
+        },
+    ));
+    assert!(matches!(
+        h.recv().await,
+        ServerMessage::Error {
+            error: ProtocolError {
+                code: ErrorCode::InvalidRequest,
+                ..
+            },
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn history_rejects_limit_above_hard_maximum() {
+    let mut h = harness().await;
+    h.send(&req("h", RequestBody::History { limit: Some(101) }));
+    assert!(matches!(
+        h.recv().await,
+        ServerMessage::Error {
+            error: ProtocolError {
+                code: ErrorCode::InvalidRequest,
+                ..
+            },
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -778,19 +916,13 @@ setup = 'export GREETING=hi'
         },
     ));
     let msgs = h.recv_all_for("e").await;
-    let mut saw_hi = false;
-    for m in &msgs {
-        if let ServerMessage::ExecEvent(ExecEvent {
-            event: ExecEventKind::Stdout { data },
+    assert!(matches!(
+        &msgs[0],
+        ServerMessage::Result {
+            result: ResultBody::Exec(ExecResult { stdout, .. }),
             ..
-        }) = m
-        {
-            if data.contains("hi") {
-                saw_hi = true;
-            }
-        }
-    }
-    assert!(saw_hi, "profile setup should have exported GREETING=hi");
+        } if stdout.prefix.contains("hi")
+    ));
 }
 
 #[tokio::test]
@@ -1068,7 +1200,7 @@ async fn exec_recorded_in_history_and_operation_get() {
         let mut id = None;
         for m in &msgs {
             if let ServerMessage::Result {
-                result: ResultBody::Exit { operation_id, .. },
+                result: ResultBody::Exec(ExecResult { operation_id, .. }),
                 ..
             } = m
             {
@@ -1091,7 +1223,9 @@ async fn exec_recorded_in_history_and_operation_get() {
                 AnyOperationRecord::Exec(e) => {
                     assert_eq!(e.operation_id, op_id);
                     assert_eq!(e.argv, vec!["echo".to_string(), "recorded".to_string()]);
-                    assert_eq!(e.exit_code, Some(0));
+                    assert_eq!(e.termination, Some(ExecTermination::Exited { code: 0 }));
+                    assert!(e.stdout.prefix.is_empty());
+                    assert_eq!(e.stdout.omitted_bytes, e.stdout.total_bytes);
                     // duration_ms field is present and non-negative by type.
                 }
                 other => panic!("expected exec record, got {other:?}"),
@@ -1109,22 +1243,19 @@ async fn exec_recorded_in_history_and_operation_get() {
     ));
     let m = h.recv().await;
     assert!(matches!(
-        m,
+        &m,
         ServerMessage::Result {
             result: ResultBody::Operation(OperationDetails {
-                record: AnyOperationRecord::Exec(_),
+                record: AnyOperationRecord::Exec(exec),
             }),
             ..
-        }
+        } if exec.stdout.prefix.contains("recorded")
     ));
 
-    // stdout blob must be retrievable.
-    let blob = std::fs::read(
-        h.root_path
-            .join(format!(".agent-remote/blobs/{op_id}.stdout")),
-    )
-    .unwrap();
-    assert!(String::from_utf8_lossy(&blob).contains("recorded"));
+    assert!(!h
+        .root_path
+        .join(format!(".agent-remote/blobs/{op_id}.stdout"))
+        .exists());
 }
 
 // F6: rejected exec also consumes an id and is recorded.
@@ -1153,7 +1284,7 @@ async fn rejected_exec_recorded_with_disposition() {
             match &operations[0] {
                 AnyOperationRecord::Exec(e) => {
                     assert_eq!(e.disposition, ExecDisposition::Rejected);
-                    assert_eq!(e.exit_code, None);
+                    assert_eq!(e.termination, None);
                 }
                 other => panic!("expected rejected exec record, got {other:?}"),
             }
@@ -2036,6 +2167,8 @@ async fn rejected_exec_replay_returns_error_not_exit() {
         "timestamp_ms": 1,
         "error": "unknown profile: nope",
         "error_code": "INVALID_REQUEST",
+        "stdout": {"prefix": "", "suffix": "", "total_bytes": 0, "omitted_bytes": 0},
+        "stderr": {"prefix": "", "suffix": "", "total_bytes": 0, "omitted_bytes": 0},
     });
     std::fs::write(&ops_path, format!("{rejected}\n")).unwrap();
     // Request is still InProgress (terminal result was lost in the crash).
@@ -2073,7 +2206,7 @@ async fn rejected_exec_replay_returns_error_not_exit() {
         matches!(
             msg,
             ServerMessage::Result {
-                result: ResultBody::Exit { .. },
+                result: ResultBody::Exec(_),
                 ..
             }
         )
@@ -2233,27 +2366,20 @@ async fn continuous_output_command_is_killed_at_deadline() {
     ));
     let msgs = h.recv_all_for("e").await;
     let elapsed = start.elapsed();
-    let mut disposition_seen = None;
-    for m in &msgs {
-        if let ServerMessage::Result {
-            result: ResultBody::Exit { exit_code, .. },
-            ..
-        } = m
-        {
-            disposition_seen = Some(*exit_code);
-        }
-    }
     assert!(
         elapsed < std::time::Duration::from_secs(5),
         "continuous-output command was not killed at deadline (elapsed {elapsed:?})"
     );
-    let code = disposition_seen.expect("must see an exit result");
-    // Killed by signal -> the exec outcome reports -1 (the server synthesizes
-    // this when timed_out is true, regardless of the wait status).
-    assert!(
-        code < 0,
-        "expected signal-killed exit code, got {code} (elapsed {elapsed:?})"
-    );
+    assert!(matches!(
+        &msgs[0],
+        ServerMessage::Result {
+            result: ResultBody::Exec(ExecResult {
+                termination: ExecTermination::TimedOut,
+                ..
+            }),
+            ..
+        }
+    ));
 }
 
 // Regression: stdout split across two pipe reads at a UTF-8 codepoint boundary
@@ -2280,16 +2406,13 @@ async fn cross_chunk_utf8_stdout_reassembled() {
         },
     ));
     let msgs = h.recv_all_for("e").await;
-    let mut combined = String::new();
-    for m in &msgs {
-        if let ServerMessage::ExecEvent(ExecEvent {
-            event: ExecEventKind::Stdout { data },
+    let combined = match &msgs[0] {
+        ServerMessage::Result {
+            result: ResultBody::Exec(result),
             ..
-        }) = m
-        {
-            combined.push_str(data);
-        }
-    }
+        } => format!("{}{}", result.stdout.prefix, result.stdout.suffix),
+        other => panic!("unexpected: {other:?}"),
+    };
     assert!(
         combined.contains('é'),
         "expected reassembled é in {combined:?}"
@@ -2474,16 +2597,13 @@ async fn incomplete_trailing_utf8_flushed_on_clean_exit() {
         },
     ));
     let msgs = h.recv_all_for("e").await;
-    let mut combined = String::new();
-    for m in &msgs {
-        if let ServerMessage::ExecEvent(ExecEvent {
-            event: ExecEventKind::Stdout { data },
+    let combined = match &msgs[0] {
+        ServerMessage::Result {
+            result: ResultBody::Exec(result),
             ..
-        }) = m
-        {
-            combined.push_str(data);
-        }
-    }
+        } => format!("{}{}", result.stdout.prefix, result.stdout.suffix),
+        other => panic!("unexpected: {other:?}"),
+    };
     // Must contain the replacement char (U+FFFD) from the flush path — not be
     // empty (which would silently lose the byte).
     assert!(
@@ -2511,16 +2631,13 @@ async fn invalid_utf8_byte_emitted_as_replacement() {
         },
     ));
     let msgs = h.recv_all_for("e").await;
-    let mut combined = String::new();
-    for m in &msgs {
-        if let ServerMessage::ExecEvent(ExecEvent {
-            event: ExecEventKind::Stdout { data },
+    let combined = match &msgs[0] {
+        ServerMessage::Result {
+            result: ResultBody::Exec(result),
             ..
-        }) = m
-        {
-            combined.push_str(data);
-        }
-    }
+        } => format!("{}{}", result.stdout.prefix, result.stdout.suffix),
+        other => panic!("unexpected: {other:?}"),
+    };
     assert!(
         combined.contains('\u{FFFD}'),
         "invalid byte 0xFF must emit U+FFFD, got: {combined:?}"

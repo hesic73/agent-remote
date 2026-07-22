@@ -1,22 +1,25 @@
+use std::collections::VecDeque;
+use std::os::unix::process::ExitStatusExt;
 use std::time::Duration;
 
-use agent_remote_protocol::{ErrorCode, ExecEventKind, OperationId, ProtocolError};
+use agent_remote_protocol::{ErrorCode, ExecOutput, ExecTermination, OperationId, ProtocolError};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::config::ServerConfig;
 use crate::workspace::Workspace;
 
+pub const OUTPUT_PREFIX_LIMIT: usize = 4 * 1024;
+pub const OUTPUT_SUFFIX_LIMIT: usize = 12 * 1024;
+pub const DEFAULT_TIMEOUT_MS: u64 = 5 * 60 * 1000;
+pub const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
+
 pub struct ExecOutcome {
-    pub exit_code: i32,
     pub operation_id: OperationId,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
+    pub termination: ExecTermination,
+    pub stdout: ExecOutput,
+    pub stderr: ExecOutput,
     pub duration_ms: u64,
-    /// True if the process was killed by timeout.
-    pub timed_out: bool,
-    /// True if either captured stream hit CAPTURE_LIMIT.
-    pub output_truncated: bool,
 }
 
 enum StreamEvent {
@@ -24,11 +27,7 @@ enum StreamEvent {
     Stderr(Vec<u8>),
 }
 
-/// Run a command, streaming stdout/stderr chunks via `emit`. `emit` returns a
-/// future so the caller can perform async writes. Captures the full stdout and
-/// stderr for logging. Returns the final exit code and timing.
-#[allow(clippy::too_many_arguments)]
-pub async fn exec<F, Fut>(
+pub async fn exec(
     ws: &Workspace,
     config: &ServerConfig,
     cwd: Option<&str>,
@@ -36,16 +35,18 @@ pub async fn exec<F, Fut>(
     argv: &[String],
     timeout_ms: Option<u64>,
     operation_id: OperationId,
-    mut emit: F,
-) -> Result<ExecOutcome, ProtocolError>
-where
-    F: FnMut(ExecEventKind) -> Fut,
-    Fut: std::future::Future<Output = ()>,
-{
+) -> Result<ExecOutcome, ProtocolError> {
     if argv.is_empty() {
         return Err(ProtocolError::new(
             ErrorCode::InvalidRequest,
             "argv must not be empty",
+        ));
+    }
+    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+    if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("timeout_ms must be between 1 and {MAX_TIMEOUT_MS}"),
         ));
     }
     let setup = config.setup_for(profile)?;
@@ -53,12 +54,6 @@ where
         Some(c) => ws.resolve(c)?,
         None => ws.root.clone(),
     };
-    if !working_dir.starts_with(&ws.root) {
-        return Err(ProtocolError::new(
-            ErrorCode::PathOutsideRoot,
-            "cwd escapes workspace root",
-        ));
-    }
     if !working_dir.is_dir() {
         return Err(ProtocolError::new(
             ErrorCode::NotFound,
@@ -66,10 +61,9 @@ where
         ));
     }
 
-    // Always run through bash so profile setup (conda/ROS/etc) takes effect.
-    // After sourcing the setup, `exec` replaces the shell with the target
-    // command so signals propagate naturally to the child.
     let quoted: Vec<String> = argv.iter().map(|a| shell_quote(a)).collect();
+    // Profiles are shell snippets, so every invocation runs through bash and
+    // then replaces it with the requested argv for direct signal delivery.
     let script = if setup.is_empty() {
         format!("exec {}", quoted.join(" "))
     } else {
@@ -80,14 +74,14 @@ where
     cmd.arg("-c")
         .arg(&script)
         .current_dir(&working_dir)
+        .env("AGENT_REMOTE_SCRATCH", &ws.scratch_root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    // Put the child in its own process group so a timeout can kill the whole
-    // tree (grandchildren included), not just the direct bash process. Without
-    // this, a grandchild holding the stdout pipe can keep a timed-out exec alive.
     unsafe {
+        // Isolate the command tree so timeout kills descendants that inherited
+        // a pipe as well as the direct child.
         cmd.pre_exec(|| {
             libc::setsid();
             Ok(())
@@ -102,347 +96,141 @@ where
     let stderr = child.stderr.take().expect("piped stderr");
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
-    let tx1 = tx.clone();
-    tokio::spawn(async move {
-        let mut reader = stdout;
-        let mut buf = [0u8; 8192];
-        loop {
-            match reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if tx1
-                        .send(StreamEvent::Stdout(buf[..n].to_vec()))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-    let tx2 = tx.clone();
-    tokio::spawn(async move {
-        let mut reader = stderr;
-        let mut buf = [0u8; 8192];
-        loop {
-            match reader.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if tx2
-                        .send(StreamEvent::Stderr(buf[..n].to_vec()))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-    });
+    spawn_reader(stdout, tx.clone(), StreamEvent::Stdout);
+    spawn_reader(stderr, tx.clone(), StreamEvent::Stderr);
     drop(tx);
 
-    // ABSOLUTE deadline computed ONCE, before the loop. Recreating the timer
-    // each iteration (the old bug) let a continuously-outputting command reset
-    // the timer forever and bypass the timeout entirely.
-    let deadline = timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
-    let mut timed_out = false;
-    let mut captured_stdout: Vec<u8> = Vec::new();
-    let mut captured_stderr: Vec<u8> = Vec::new();
-    let mut output_truncated = false;
-    // Incremental UTF-8 decoders per stream so a multi-byte codepoint split
-    // across two pipe reads is emitted as one correct character, not two
-    // replacement chars.
-    let mut stdout_dec = Utf8Decoder::new();
-    let mut stderr_dec = Utf8Decoder::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let mut captured_stdout = OutputCapture::default();
+    let mut captured_stderr = OutputCapture::default();
 
-    loop {
-        // NO `biased`: a fair select means the deadline arm has a real chance
-        // to fire even when output is constantly available. We also poll the
-        // deadline FIRST on every iteration so a command producing output every
-        // few ms is still killed at the deadline.
-        if let Some(dl) = deadline {
-            if tokio::time::Instant::now() >= dl {
-                timed_out = true;
-                kill_process_group(pid);
-                let _ = child.start_kill();
-                break;
-            }
+    let termination = loop {
+        if tokio::time::Instant::now() >= deadline {
+            kill_process_group(pid);
+            let _ = child.start_kill();
+            break ExecTermination::TimedOut;
         }
         tokio::select! {
-            // Deadline first (after the explicit check above) so it cannot be
-            // starved by constant output.
-            () = async {
-                match deadline {
-                    Some(dl) => tokio::time::sleep_until(dl).await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => {
-                timed_out = true;
+            () = tokio::time::sleep_until(deadline) => {
                 kill_process_group(pid);
                 let _ = child.start_kill();
+                break ExecTermination::TimedOut;
             }
-            Some(ev) = rx.recv() => {
-                handle_stream_event(
-                    &ev,
-                    &mut captured_stdout,
-                    &mut captured_stderr,
-                    &mut output_truncated,
-                    &mut stdout_dec,
-                    &mut stderr_dec,
-                    &mut emit,
-                )
-                .await;
-            }
-            res = child.wait() => {
-                // Drain remaining buffered output.
-                while let Some(ev) = rx.recv().await {
-                    handle_stream_event(
-                        &ev,
-                        &mut captured_stdout,
-                        &mut captured_stderr,
-                        &mut output_truncated,
-                        &mut stdout_dec,
-                        &mut stderr_dec,
-                        &mut emit,
-                    )
-                    .await;
-                }
-                // Flush any trailing incomplete UTF-8 sequence (same as the
-                // timeout path's drain_after_kill does).
-                if let Some(text) = stdout_dec.flush() {
-                    if !text.is_empty() {
-                        emit(ExecEventKind::Stdout { data: text }).await;
-                    }
-                }
-                if let Some(text) = stderr_dec.flush() {
-                    if !text.is_empty() {
-                        emit(ExecEventKind::Stderr { data: text }).await;
-                    }
-                }
-                let _ = res; // status is meaningful only if we did not time out
-                if timed_out {
-                    break;
-                }
-                let status = res.map_err(|e| {
+            Some(event) = rx.recv() => capture(event, &mut captured_stdout, &mut captured_stderr),
+            status = child.wait() => {
+                let status = status.map_err(|e| {
                     ProtocolError::new(ErrorCode::ExecFailed, format!("wait failed: {e}"))
                 })?;
-                let exit_code = status.code().unwrap_or(-1);
-                return Ok(ExecOutcome {
-                    exit_code,
-                    operation_id,
-                    stdout: captured_stdout,
-                    stderr: captured_stderr,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    timed_out: false,
-                    output_truncated,
-                });
+                break match status.code() {
+                    Some(code) => ExecTermination::Exited { code },
+                    None => ExecTermination::Signaled {
+                        signal: status.signal().unwrap_or(0),
+                    },
+                };
             }
         }
+    };
+
+    if matches!(termination, ExecTermination::TimedOut) {
+        let _ = child.wait().await;
+    }
+    while let Some(event) = rx.recv().await {
+        capture(event, &mut captured_stdout, &mut captured_stderr);
     }
 
-    // Reaching here means we broke out due to timeout. Reap the child and flush
-    // any trailing decoder state.
-    drain_after_kill(
-        &mut rx,
-        &mut captured_stdout,
-        &mut captured_stderr,
-        &mut output_truncated,
-        &mut stdout_dec,
-        &mut stderr_dec,
-        &mut emit,
-    )
-    .await;
-    let _ = child.wait().await;
     Ok(ExecOutcome {
-        exit_code: -1,
         operation_id,
-        stdout: captured_stdout,
-        stderr: captured_stderr,
+        termination,
+        stdout: captured_stdout.finish(),
+        stderr: captured_stderr.finish(),
         duration_ms: start.elapsed().as_millis() as u64,
-        timed_out,
-        output_truncated,
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_stream_event<F, Fut>(
-    ev: &StreamEvent,
-    captured_stdout: &mut Vec<u8>,
-    captured_stderr: &mut Vec<u8>,
-    output_truncated: &mut bool,
-    stdout_dec: &mut Utf8Decoder,
-    stderr_dec: &mut Utf8Decoder,
-    emit: &mut F,
-) where
-    F: FnMut(ExecEventKind) -> Fut,
-    Fut: std::future::Future<Output = ()>,
+fn spawn_reader<R, F>(mut reader: R, tx: tokio::sync::mpsc::Sender<StreamEvent>, wrap: F)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    F: Fn(Vec<u8>) -> StreamEvent + Send + 'static,
 {
-    match ev {
-        StreamEvent::Stdout(b) => {
-            if extend_capped(captured_stdout, b, CAPTURE_LIMIT) {
-                *output_truncated = true;
-            }
-            if let Some(text) = stdout_dec.feed(b) {
-                emit(ExecEventKind::Stdout { data: text }).await;
+    tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(wrap(buf[..n].to_vec())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
-        StreamEvent::Stderr(b) => {
-            if extend_capped(captured_stderr, b, CAPTURE_LIMIT) {
-                *output_truncated = true;
+    });
+}
+
+fn capture(event: StreamEvent, stdout: &mut OutputCapture, stderr: &mut OutputCapture) {
+    match event {
+        StreamEvent::Stdout(bytes) => stdout.push(&bytes),
+        StreamEvent::Stderr(bytes) => stderr.push(&bytes),
+    }
+}
+
+#[derive(Default)]
+struct OutputCapture {
+    prefix: Vec<u8>,
+    suffix: VecDeque<u8>,
+    total_bytes: u64,
+}
+
+impl OutputCapture {
+    fn push(&mut self, mut bytes: &[u8]) {
+        self.total_bytes = self.total_bytes.saturating_add(bytes.len() as u64);
+        let prefix_remaining = OUTPUT_PREFIX_LIMIT - self.prefix.len();
+        let prefix_len = prefix_remaining.min(bytes.len());
+        self.prefix.extend_from_slice(&bytes[..prefix_len]);
+        bytes = &bytes[prefix_len..];
+
+        for byte in bytes {
+            if self.suffix.len() == OUTPUT_SUFFIX_LIMIT {
+                self.suffix.pop_front();
             }
-            if let Some(text) = stderr_dec.feed(b) {
-                emit(ExecEventKind::Stderr { data: text }).await;
-            }
+            self.suffix.push_back(*byte);
+        }
+    }
+
+    fn finish(mut self) -> ExecOutput {
+        let kept_bytes = self.prefix.len() + self.suffix.len();
+        ExecOutput {
+            prefix: bounded_lossy(&self.prefix, OUTPUT_PREFIX_LIMIT),
+            suffix: bounded_lossy(self.suffix.make_contiguous(), OUTPUT_SUFFIX_LIMIT),
+            total_bytes: self.total_bytes,
+            omitted_bytes: self.total_bytes.saturating_sub(kept_bytes as u64),
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn drain_after_kill<F, Fut>(
-    rx: &mut tokio::sync::mpsc::Receiver<StreamEvent>,
-    captured_stdout: &mut Vec<u8>,
-    captured_stderr: &mut Vec<u8>,
-    output_truncated: &mut bool,
-    stdout_dec: &mut Utf8Decoder,
-    stderr_dec: &mut Utf8Decoder,
-    emit: &mut F,
-) where
-    F: FnMut(ExecEventKind) -> Fut,
-    Fut: std::future::Future<Output = ()>,
-{
-    // Best-effort drain of output already buffered by the reader tasks, then
-    // flush any trailing incomplete UTF-8 sequence as a replacement char so the
-    // client sees a clean end-of-stream.
-    while let Ok(ev) = rx.try_recv() {
-        handle_stream_event(
-            &ev,
-            captured_stdout,
-            captured_stderr,
-            output_truncated,
-            stdout_dec,
-            stderr_dec,
-            emit,
-        )
-        .await;
-    }
-    if let Some(text) = stdout_dec.flush() {
-        if !text.is_empty() {
-            emit(ExecEventKind::Stdout { data: text }).await;
+fn bounded_lossy(bytes: &[u8], limit: usize) -> String {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    if text.len() > limit {
+        let mut end = limit;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
         }
+        text.truncate(end);
     }
-    if let Some(text) = stderr_dec.flush() {
-        if !text.is_empty() {
-            emit(ExecEventKind::Stderr { data: text }).await;
-        }
-    }
+    text
 }
 
 fn kill_process_group(pid: Option<u32>) {
     if let Some(pid) = pid {
-        let pg = pid as i32;
         unsafe {
-            libc::killpg(pg, libc::SIGKILL);
+            libc::killpg(pid as i32, libc::SIGKILL);
         }
-    }
-}
-
-/// Upper bound on in-memory captured output per stream, to keep a runaway
-/// command from OOMing the server. Output beyond this is still streamed to the
-/// client live; only the *captured* copy (for logging) is truncated.
-const CAPTURE_LIMIT: usize = 64 * 1024 * 1024;
-
-/// Returns true if this chunk hit the cap (truncation occurred).
-fn extend_capped(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
-    if buf.len() >= cap {
-        return true;
-    }
-    let remaining = cap - buf.len();
-    if chunk.len() <= remaining {
-        buf.extend_from_slice(chunk);
-        false
-    } else {
-        buf.extend_from_slice(&chunk[..remaining]);
-        true
-    }
-}
-
-/// Incremental UTF-8 decoder. Accumulates bytes that do not yet form a complete
-/// sequence and emits the decoded prefix; a trailing partial codepoint is held
-/// until the next chunk completes it (or flush() replaces it on stream end).
-struct Utf8Decoder {
-    pending: Vec<u8>,
-}
-
-impl Utf8Decoder {
-    fn new() -> Self {
-        Self {
-            pending: Vec::new(),
-        }
-    }
-
-    /// Feed bytes; returns Some(text) to emit (possibly empty if everything is
-    /// still partial) or None if there is nothing complete yet.
-    fn feed(&mut self, bytes: &[u8]) -> Option<String> {
-        self.pending.extend_from_slice(bytes);
-        let mut out = String::new();
-        // Repeatedly extract the longest valid UTF-8 prefix. When the prefix
-        // ends on an incomplete sequence, hold those bytes for the next chunk.
-        // When it ends on a genuinely invalid byte, emit U+FFFD in its place
-        // (the client still sees the lossy replacement rather than nothing).
-        loop {
-            if self.pending.is_empty() {
-                return if out.is_empty() { None } else { Some(out) };
-            }
-            match std::str::from_utf8(&self.pending) {
-                Ok(s) => {
-                    out.push_str(s);
-                    self.pending.clear();
-                    return Some(out);
-                }
-                Err(e) => {
-                    let valid = e.valid_up_to();
-                    if valid > 0 {
-                        out.push_str(std::str::from_utf8(&self.pending[..valid]).unwrap());
-                        self.pending.drain(..valid);
-                        continue;
-                    }
-                    // valid == 0: first byte is problematic.
-                    if let Some(err_len) = e.error_len() {
-                        // Genuinely invalid byte(s): emit a replacement char
-                        // for them so the client sees something, then advance.
-                        out.push('\u{FFFD}');
-                        self.pending.drain(..err_len);
-                    } else {
-                        // Incomplete multi-byte sequence: hold everything for
-                        // the next chunk.
-                        return if out.is_empty() { None } else { Some(out) };
-                    }
-                }
-            }
-        }
-    }
-
-    /// Flush any remaining bytes as lossy UTF-8 (replacement chars), called when
-    /// the stream ends. Returns None if nothing was pending.
-    fn flush(&mut self) -> Option<String> {
-        if self.pending.is_empty() {
-            return None;
-        }
-        let s = String::from_utf8_lossy(&self.pending).into_owned();
-        self.pending.clear();
-        Some(s)
     }
 }
 
 fn shell_quote(s: &str) -> String {
     if s.is_empty() {
         return "''".into();
-    }
-    if s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || "-_./=:".contains(c))
-    {
-        return s.into();
     }
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -452,49 +240,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn utf8_decoder_holds_split_codepoint() {
-        // "é" is 0xC3 0xA9 (2 bytes). Feed the first byte, then the second.
-        let mut dec = Utf8Decoder::new();
-        assert_eq!(dec.feed(&[0xC3]), None, "leader alone is incomplete");
-        let got = dec.feed(&[0xA9]).unwrap();
-        assert_eq!(got, "é");
+    fn output_capture_keeps_whole_small_output() {
+        let mut capture = OutputCapture::default();
+        capture.push("hello".as_bytes());
+        let output = capture.finish();
+        assert_eq!(output.prefix, "hello");
+        assert_eq!(output.suffix, "");
+        assert_eq!(output.total_bytes, 5);
+        assert_eq!(output.omitted_bytes, 0);
     }
 
     #[test]
-    fn utf8_decoder_emits_complete_prefix() {
-        // "ab" + incomplete leader 0xC3 -> emit "ab", hold 0xC3.
-        let mut dec = Utf8Decoder::new();
-        let got = dec.feed(b"ab\xc3").unwrap();
-        assert_eq!(got, "ab");
-        assert_eq!(dec.flush(), Some("\u{FFFD}".into()));
+    fn output_capture_keeps_fixed_prefix_and_suffix() {
+        let bytes = vec![b'x'; OUTPUT_PREFIX_LIMIT + OUTPUT_SUFFIX_LIMIT + 37];
+        let mut capture = OutputCapture::default();
+        for chunk in bytes.chunks(997) {
+            capture.push(chunk);
+        }
+        let output = capture.finish();
+        assert_eq!(output.prefix.len(), OUTPUT_PREFIX_LIMIT);
+        assert_eq!(output.suffix.len(), OUTPUT_SUFFIX_LIMIT);
+        assert_eq!(output.total_bytes, bytes.len() as u64);
+        assert_eq!(output.omitted_bytes, 37);
     }
 
     #[test]
-    fn utf8_decoder_flushes_trailing_as_replacement() {
-        let mut dec = Utf8Decoder::new();
-        assert_eq!(dec.feed(&[0xE2, 0x82]), None); // 3-byte leader, 2 bytes
-        let got = dec.flush().unwrap();
-        assert_eq!(got, "\u{FFFD}");
-    }
-
-    #[test]
-    fn utf8_decoder_emits_replacement_for_invalid_byte() {
-        // 0xFF is never a valid UTF-8 byte; it should be emitted as U+FFFD.
-        let mut dec = Utf8Decoder::new();
-        let got = dec.feed(b"\xFFok");
-        assert_eq!(got, Some("\u{FFFD}ok".into()));
-    }
-
-    #[test]
-    fn extend_capped_stops_at_cap_and_reports_truncation() {
-        let mut buf = Vec::new();
-        assert!(!extend_capped(&mut buf, b"abc", 5));
-        assert!(
-            extend_capped(&mut buf, b"defg", 5),
-            "crossing cap truncates"
-        );
-        assert_eq!(buf, b"abcde");
-        assert!(extend_capped(&mut buf, b"x", 5), "already-full drops input");
-        assert_eq!(buf, b"abcde");
+    fn output_capture_is_utf8_safe_at_preview_boundaries() {
+        let mut bytes = vec![b'a'; OUTPUT_PREFIX_LIMIT - 1];
+        bytes.extend_from_slice("é".as_bytes());
+        bytes.extend(vec![b'b'; OUTPUT_SUFFIX_LIMIT + 1]);
+        let mut capture = OutputCapture::default();
+        capture.push(&bytes);
+        let output = capture.finish();
+        assert!(output.prefix.is_char_boundary(output.prefix.len()));
+        assert!(output.suffix.is_char_boundary(output.suffix.len()));
+        assert!(output.prefix.len() <= OUTPUT_PREFIX_LIMIT);
+        assert!(output.suffix.len() <= OUTPUT_SUFFIX_LIMIT);
     }
 }

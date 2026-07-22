@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use agent_remote_client::{ArgvTransport, Client, ClientLog};
-use agent_remote_protocol::{ExecEventKind, ListKind};
+use agent_remote_protocol::{ExecOutput, ExecTermination, ListKind};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -52,7 +52,13 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// List a directory.
-    Ls { path: String },
+    Ls {
+        path: String,
+        #[arg(long)]
+        offset: Option<usize>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Stat a file or directory.
     Stat { path: String },
     /// Read a file.
@@ -162,9 +168,13 @@ async fn async_main_real() -> Result<()> {
         .context("connect to server")?;
 
     match cli.command {
-        Command::Ls { path } => {
-            let entries = client.list(&path).await?;
-            for e in entries {
+        Command::Ls {
+            path,
+            offset,
+            limit,
+        } => {
+            let result = client.list(&path, offset, limit).await?;
+            for e in result.entries {
                 let kind = match e.kind {
                     ListKind::File => 'f',
                     ListKind::Dir => 'd',
@@ -174,6 +184,9 @@ async fn async_main_real() -> Result<()> {
                     Some(s) => println!("{kind} {:>10} {}", s, e.name),
                     None => println!("{kind} {:>10} {}", '-', e.name),
                 }
+            }
+            if let Some(next) = result.next_offset {
+                eprintln!("[more entries: use --offset {next}]");
             }
         }
         Command::Stat { path } => {
@@ -187,8 +200,8 @@ async fn async_main_real() -> Result<()> {
         } => {
             let r = client.read(&path, offset, limit).await?;
             print!("{}", r.content);
-            if r.truncated {
-                eprintln!("\n[truncated]");
+            if let Some(next) = r.next_offset {
+                eprintln!("\n[truncated: use --offset {next}]");
             }
         }
         Command::Write {
@@ -218,20 +231,18 @@ async fn async_main_real() -> Result<()> {
             if argv.is_empty() {
                 return Err(anyhow!("exec requires at least one argv element"));
             }
-            let (code, op) = client
-                .exec(argv, cwd, profile, timeout_ms, |ev| match ev {
-                    ExecEventKind::Stdout { data } => {
-                        use std::io::Write;
-                        let _ = std::io::stdout().write_all(data.as_bytes());
-                    }
-                    ExecEventKind::Stderr { data } => {
-                        use std::io::Write;
-                        let _ = std::io::stderr().write_all(data.as_bytes());
-                    }
-                    ExecEventKind::Exit { .. } => {}
-                })
-                .await?;
-            eprintln!("[exit {code}] operation_id={op}");
+            let result = client.exec(argv, cwd, profile, timeout_ms).await?;
+            print_exec_output(&result.stdout, false);
+            print_exec_output(&result.stderr, true);
+            eprintln!(
+                "[{:?}] operation_id={} duration_ms={}",
+                result.termination, result.operation_id, result.duration_ms
+            );
+            let code = match result.termination {
+                ExecTermination::Exited { code } => code,
+                ExecTermination::TimedOut => 124,
+                ExecTermination::Signaled { signal } => 128 + signal,
+            };
             std::process::exit(code);
         }
         Command::Rm { path } => {
@@ -260,6 +271,21 @@ async fn async_main_real() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn print_exec_output(output: &ExecOutput, stderr: bool) {
+    use std::io::Write;
+
+    let mut text = output.prefix.clone();
+    if output.omitted_bytes > 0 {
+        text.push_str(&format!("\n[{} bytes omitted]\n", output.omitted_bytes));
+    }
+    text.push_str(&output.suffix);
+    if stderr {
+        let _ = std::io::stderr().write_all(text.as_bytes());
+    } else {
+        let _ = std::io::stdout().write_all(text.as_bytes());
+    }
 }
 
 fn read_input(file: Option<PathBuf>) -> Result<String> {

@@ -113,6 +113,16 @@ fn mcp_initialize_and_server_info() {
         }),
     );
     assert_eq!(resp["result"]["serverInfo"]["name"], "agent-remote-mcp");
+    assert_eq!(
+        resp["result"]["instructions"],
+        include_str!("../../../AGENT_GUIDANCE.md")
+    );
+    for doc in [
+        include_str!("../../../README.md"),
+        include_str!("../../../DESIGN.md"),
+    ] {
+        assert!(doc.contains("AGENT_GUIDANCE.md"));
+    }
     // Send initialized notification.
     s.notify("notifications/initialized", serde_json::json!({}));
 }
@@ -245,7 +255,9 @@ fn mcp_run_command_returns_exit_code() {
     assert_eq!(resp["result"]["isError"], false);
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("hello-from-mcp"), "stdout missing: {text}");
-    assert!(text.contains("exit code: 0"), "exit code missing: {text}");
+    let result: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(result["termination"]["kind"], "exited");
+    assert_eq!(result["termination"]["code"], 0);
 }
 
 // Drive every remaining tool over real MCP stdio: stat, patch_file,

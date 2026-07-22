@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use agent_remote_client::{Client, Transport};
-use agent_remote_protocol::{ExecEventKind, ListKind};
+use agent_remote_protocol::{ExecTermination, ListKind};
 
 /// Path to the built agent-remote-server binary.
 fn server_bin() -> PathBuf {
@@ -77,8 +77,9 @@ async fn end_to_end_write_read_list_stat() {
     assert_eq!(r.content, "print('hi')\n");
     assert!(!r.truncated);
 
-    let entries = client.list("src").await.unwrap();
-    assert!(entries
+    let result = client.list("src", None, None).await.unwrap();
+    assert!(result
+        .entries
         .iter()
         .any(|e| e.name == "main.py" && e.kind == ListKind::File));
 
@@ -118,11 +119,10 @@ async fn end_to_end_stale_hash_errors() {
 }
 
 #[tokio::test]
-async fn end_to_end_exec_streams() {
+async fn end_to_end_exec_returns_bounded_result() {
     let dir = tempfile::tempdir().unwrap();
     let client = make_client(dir.path()).await;
-    let mut stdout = String::new();
-    let (code, _op) = client
+    let result = client
         .exec(
             vec![
                 "sh".into(),
@@ -132,16 +132,12 @@ async fn end_to_end_exec_streams() {
             None,
             None,
             Some(10000),
-            |ev| {
-                if let ExecEventKind::Stdout { data } = &ev {
-                    stdout.push_str(data);
-                }
-            },
         )
         .await
         .unwrap();
-    assert_eq!(code, 3);
-    assert!(stdout.contains("hello"));
+    assert_eq!(result.termination, ExecTermination::Exited { code: 3 });
+    assert!(result.stdout.prefix.contains("hello"));
+    assert!(result.stderr.prefix.contains("err"));
 }
 
 #[tokio::test]
@@ -229,8 +225,6 @@ async fn client_returns_closed_when_server_dies() {
 // F3: exec must not hang when the connection closes mid-stream.
 #[tokio::test]
 async fn client_exec_returns_closed_when_server_dies() {
-    use agent_remote_protocol::ExecEventKind;
-
     struct DeadTransport;
     impl Transport for DeadTransport {
         fn spawn(
@@ -260,13 +254,7 @@ async fn client_exec_returns_closed_when_server_dies() {
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        client.exec(
-            vec!["sleep".into(), "10".into()],
-            None,
-            None,
-            None,
-            |_e: ExecEventKind| {},
-        ),
+        client.exec(vec!["sleep".into(), "10".into()], None, None, None),
     )
     .await;
     match result {
