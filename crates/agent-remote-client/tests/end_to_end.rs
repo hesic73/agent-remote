@@ -52,7 +52,7 @@ async fn make_client(root: &Path) -> Client {
         "--root".into(),
         root.to_string_lossy().into_owned(),
         // Keep server state inside the test tempdir instead of the real HOME.
-        "--log-dir".into(),
+        "--state-base".into(),
         root.join(".agent-remote-test")
             .to_string_lossy()
             .into_owned(),
@@ -344,7 +344,7 @@ async fn cli_over_fake_ssh_quotes_paths_with_spaces() {
         srv.to_string_lossy().into_owned(),
         "--root".to_string(),
         root.to_string_lossy().into_owned(),
-        "--log-dir".to_string(),
+        "--state-base".to_string(),
         state.to_string_lossy().into_owned(),
     ];
 
@@ -377,13 +377,20 @@ async fn cli_over_fake_ssh_quotes_paths_with_spaces() {
         .unwrap();
     assert!(out.status.success(), "cat over fake ssh failed: {out:?}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hello over ssh");
-    // State landed in the (space-containing) state dir, not in the workspace.
-    assert!(state.join("operations.jsonl").exists());
+    // State landed under the (space-containing) base dir, keyed per root, not
+    // in the workspace.
+    let keyed: Vec<_> = std::fs::read_dir(state.join("state")).unwrap().collect();
+    assert_eq!(keyed.len(), 1);
+    assert!(keyed[0]
+        .as_ref()
+        .unwrap()
+        .path()
+        .join("operations.jsonl")
+        .exists());
     assert!(!root.join(".agent-remote").exists());
 }
 
-// --state-base redirects the state base while keeping per-root keying, and
-// conflicts with --log-dir.
+// --state-base redirects the state base while keeping per-root keying.
 #[tokio::test]
 async fn cli_state_base_redirects_state_location() {
     let base = tempfile::tempdir().unwrap();
@@ -422,23 +429,4 @@ async fn cli_state_base_redirects_state_location() {
         .starts_with(&*root_name));
     assert!(keyed.join("operations.jsonl").exists());
     assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
-
-    // Passing both --state-base and --log-dir is a hard error.
-    let out = std::process::Command::new(cli)
-        .args([
-            "--local",
-            "--remote-bin",
-            &srv.to_string_lossy(),
-            "--root",
-            &root.path().to_string_lossy(),
-            "--state-base",
-            "/tmp/a",
-            "--log-dir",
-            "/tmp/b",
-            "ls",
-            ".",
-        ])
-        .output()
-        .unwrap();
-    assert!(!out.status.success(), "conflicting flags must be rejected");
 }

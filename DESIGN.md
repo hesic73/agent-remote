@@ -136,8 +136,7 @@ the canonical root path:
 The workspace stays untouched -- nothing for `git status`, nothing a
 destructive command inside the workspace can destroy along with itself.
 `--state-base` swaps the base directory while keeping per-root keying (for
-hosts where home is nearly full); `--log-dir` pins the exact directory.
-State is per-workspace, not per-session:
+hosts where home is nearly full). State is per-workspace, not per-session:
 sessions are just connections, and cross-session features (undo, history,
 replay after reconnect) are exactly the reason the state must outlive them.
 

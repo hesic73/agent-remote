@@ -28,7 +28,8 @@ impl std::fmt::Debug for Server {
 
 pub struct ServerOptions {
     pub root: PathBuf,
-    pub log_dir: PathBuf,
+    /// Resolved state directory (operation log, blobs, request table).
+    pub state_dir: PathBuf,
     pub config_path: Option<PathBuf>,
     /// Keep only this many recent operations; pruned automatically at startup
     /// and on `gc`. `None` disables automatic pruning.
@@ -38,7 +39,7 @@ pub struct ServerOptions {
 impl Server {
     pub fn new(opts: ServerOptions) -> anyhow::Result<Self> {
         let workspace = Arc::new(Workspace::new(opts.root)?);
-        let store = OperationStore::new(opts.log_dir).map_err(|e| anyhow::anyhow!(e))?;
+        let store = OperationStore::new(opts.state_dir).map_err(|e| anyhow::anyhow!(e))?;
         // Run WAL recovery before serving: reconcile any prepared markers left
         // by a crash, and clear requests stuck InProgress so they become retryable.
         let actions = store

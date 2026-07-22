@@ -34,13 +34,9 @@ struct Cli {
     #[arg(long)]
     config: Option<String>,
 
-    /// Optional server state directory (passed to the server as --log-dir).
-    #[arg(long)]
-    log_dir: Option<String>,
-
     /// Optional base directory for server state instead of ~/.agent-remote on
     /// the remote (state still keyed per workspace under <base>/state/).
-    #[arg(long, conflicts_with = "log_dir")]
+    #[arg(long)]
     state_base: Option<String>,
 }
 
@@ -88,10 +84,6 @@ async fn main() -> Result<()> {
             argv.push("--config".into());
             argv.push(cfg.clone());
         }
-        if let Some(d) = &cli.log_dir {
-            argv.push("--log-dir".into());
-            argv.push(d.clone());
-        }
         if let Some(b) = &cli.state_base {
             argv.push("--state-base".into());
             argv.push(b.clone());
@@ -107,7 +99,6 @@ async fn main() -> Result<()> {
             &cli.remote_bin,
             &cli.root,
             cli.config.as_deref(),
-            cli.log_dir.as_deref(),
             cli.state_base.as_deref(),
         )
     };

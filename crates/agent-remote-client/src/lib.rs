@@ -598,7 +598,6 @@ pub fn ssh_server_argv(
     remote_bin: &str,
     root: &str,
     config: Option<&str>,
-    log_dir: Option<&str>,
     state_base: Option<&str>,
 ) -> Vec<String> {
     let mut cmd = shell_quote(remote_bin);
@@ -607,10 +606,6 @@ pub fn ssh_server_argv(
     if let Some(c) = config {
         cmd.push_str(" --config ");
         cmd.push_str(&shell_quote(c));
-    }
-    if let Some(d) = log_dir {
-        cmd.push_str(" --log-dir ");
-        cmd.push_str(&shell_quote(d));
     }
     if let Some(b) = state_base {
         cmd.push_str(" --state-base ");
@@ -653,31 +648,14 @@ mod quote_tests {
             "agent-remote-server",
             "/data/my project",
             None,
-            Some("/tmp/st ate"),
-            None,
+            Some("/data/sicheng/agent state"),
         );
         assert_eq!(argv[0], "ssh");
         assert_eq!(argv[1], "host");
         assert_eq!(
             argv[2],
-            "'agent-remote-server' --root '/data/my project' --log-dir '/tmp/st ate'"
+            "'agent-remote-server' --root '/data/my project' --state-base '/data/sicheng/agent state'"
         );
         assert_eq!(argv.len(), 3);
-    }
-
-    #[test]
-    fn ssh_argv_forwards_state_base() {
-        let argv = ssh_server_argv(
-            "host",
-            "srv",
-            "/r",
-            None,
-            None,
-            Some("/data/sicheng/agent state"),
-        );
-        assert_eq!(
-            argv[2],
-            "'srv' --root '/r' --state-base '/data/sicheng/agent state'"
-        );
     }
 }

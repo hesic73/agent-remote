@@ -36,7 +36,7 @@ impl McpSession {
         let state = format!("{root}/.agent-remote-test");
         let mut child = Command::new(&mcp)
             .args(["--local", "--remote-bin", &srv, "--root", root])
-            .args(["--log-dir", &state])
+            .args(["--state-base", &state])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

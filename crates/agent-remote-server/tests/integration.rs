@@ -70,7 +70,7 @@ async fn harness_at_with_owned(
 ) -> Harness {
     let server = Server::new(ServerOptions {
         root: root_path.clone(),
-        log_dir,
+        state_dir: log_dir,
         config_path,
         history_limit: None,
     })
@@ -2333,7 +2333,7 @@ async fn corrupted_middle_log_line_fails_startup() {
     // Server::new must surface an error, not silently start with a partial log.
     let result = agent_remote_server::Server::new(agent_remote_server::ServerOptions {
         root: root.path().to_path_buf(),
-        log_dir,
+        state_dir: log_dir,
         config_path: None,
         history_limit: None,
     });
@@ -2374,7 +2374,7 @@ async fn corrupted_trailing_log_line_tolerated() {
 
     let server = agent_remote_server::Server::new(agent_remote_server::ServerOptions {
         root: root.path().to_path_buf(),
-        log_dir,
+        state_dir: log_dir,
         config_path: None,
         history_limit: None,
     });
@@ -2707,7 +2707,7 @@ async fn crash_mid_utf8_codepoint_tail_recovered() {
     // crash-truncated and the file is repaired to valid JSONL.
     let server = agent_remote_server::Server::new(agent_remote_server::ServerOptions {
         root: root.path().to_path_buf(),
-        log_dir: log_dir.clone(),
+        state_dir: log_dir.clone(),
         config_path: None,
         history_limit: None,
     });
@@ -2904,7 +2904,7 @@ async fn startup_prune_respects_history_limit() {
     }
     let server = Server::new(ServerOptions {
         root: root.path().to_path_buf(),
-        log_dir,
+        state_dir: log_dir,
         config_path: None,
         history_limit: Some(1),
     })
