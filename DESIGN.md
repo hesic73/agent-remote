@@ -220,11 +220,25 @@ Operational conventions for agents live only in
 `ServerInfo.instructions`. This section documents protocol behavior rather
 than duplicating those instructions.
 
-`agent-remote-mcp` wraps the client library in an MCP stdio server, so any
-MCP-capable agent gets the workspace as tools: `list_dir`, `stat`,
+`agent-remote-mcp` wraps the client library in an MCP stdio server that
+multiplexes a fleet of named workspaces, declared in a single TOML file
+(`~/.agent-remote/workspaces.toml` by convention). A workspace is a `(machine,
+root)` pair; "two roots on one machine" and "one root each on two machines"
+are the same concept, because all server-side state is already keyed per
+root. The agent sees tools: `list_workspaces`, `list_dir`, `stat`,
 `read_file`, `write_file`, `patch_file`, `delete_file`, `run_command`,
 `upload_file`, `download_file`, `undo`, `history`, `operation_get`,
-`request_status`.
+`request_status` -- each (except `list_workspaces`) with a required
+`workspace` argument. Making it required, with no default, is deliberate: a
+call can never land on the wrong machine because a default silently filled
+in. Results echo the workspace name, since operation and request IDs are
+only unique within one workspace.
+
+The MCP process keeps one independent, lazily-opened connection per
+workspace, so a dead machine costs only its own calls, and the fleet needs
+no server-side coordination at all -- there is no cross-workspace operation
+(file movement between workspaces goes through a local file via
+`download_file` + `upload_file`).
 
 * Protocol errors map to MCP `isError` results, so failures are visible to
   the agent.

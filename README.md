@@ -140,22 +140,40 @@ Agent-facing conventions have a single canonical source in
 [`AGENT_GUIDANCE.md`](AGENT_GUIDANCE.md). The MCP server embeds that file
 verbatim in its initialization instructions.
 
-`agent-remote-mcp` exposes the same operations as MCP tools over stdio:
+`agent-remote-mcp` exposes the same operations as MCP tools over stdio. It
+serves a **fleet** of named workspaces declared in
+`~/.agent-remote/workspaces.toml` (override with `--fleet <path>`); each
+workspace is a `(machine, root)` pair, on any mix of SSH hosts and the local
+machine:
 
-```bash
-# Claude Code example
-claude mcp add remote-ws -- \
-  agent-remote-mcp --host robot@workstation --root /home/robot/project
+```toml
+# ~/.agent-remote/workspaces.toml
+[workspaces.robot]
+host = "robot@workstation"        # omit host to run on the local machine
+root = "/home/robot/project"
+bin  = "/home/robot/.local/bin/agent-remote-server"  # optional, default: on PATH
+# config / state_base optional, same meaning as the server flags
 
-# or against a local workspace (no SSH)
-claude mcp add local-ws -- \
-  agent-remote-mcp --local --remote-bin ./target/release/agent-remote-server \
-  --root /path/to/project
+[workspaces.lab-gpu]
+host = "lab-gpu-1"
+root = "/data/experiments"
 ```
 
-Tools: `list_dir`, `stat`, `read_file`, `write_file`, `patch_file`,
-`delete_file`, `run_command`, `upload_file`, `download_file`, `undo`,
-`history`, `operation_get`, `request_status`. Flags mirror the CLI.
+```bash
+# Claude Code example: one MCP entry serves every workspace
+claude mcp add agent-remote -- agent-remote-mcp
+```
+
+Tools: `list_workspaces`, `list_dir`, `stat`, `read_file`, `write_file`,
+`patch_file`, `delete_file`, `run_command`, `upload_file`, `download_file`,
+`undo`, `history`, `operation_get`, `request_status`. Every tool except
+`list_workspaces` takes a required `workspace` argument naming which
+workspace to act on. Workspaces are fully isolated: state, operation IDs,
+history, and undo are scoped per workspace (server-side, keyed by root), and
+connections are opened per workspace on demand -- an unreachable machine
+fails only its own calls. Two entries must not address the same host and
+root (they would contend for the same server state lock; the config is
+rejected at startup).
 
 `upload_file` / `download_file` move single regular files between the local
 machine and the remote workspace (or `@scratch/...`). They are synchronous and

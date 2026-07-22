@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use agent_remote_client::{Client, Endpoint};
@@ -13,6 +14,66 @@ const SERVER_NAME: &str = "agent-remote-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const AGENT_GUIDANCE: &str = include_str!("../../../AGENT_GUIDANCE.md");
 
+// ---- Fleet configuration ----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FleetFile {
+    workspaces: BTreeMap<String, WorkspaceEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceEntry {
+    /// SSH host (resolvable via ~/.ssh/config); omit to run the server on the
+    /// local machine.
+    host: Option<String>,
+    root: String,
+    /// Server binary path on that machine. Defaults to `agent-remote-server`
+    /// on PATH.
+    bin: Option<String>,
+    config: Option<String>,
+    state_base: Option<String>,
+}
+
+/// Parse and validate a fleet config. Rejects an empty fleet and two
+/// workspaces addressing the same (host, root): they would contend for the
+/// same server-side state lock and one of them would always fail.
+pub fn parse_fleet(text: &str) -> anyhow::Result<BTreeMap<String, Endpoint>> {
+    let file: FleetFile = toml::from_str(text)?;
+    if file.workspaces.is_empty() {
+        anyhow::bail!("fleet config declares no workspaces");
+    }
+    let mut seen: BTreeMap<(Option<String>, String), String> = BTreeMap::new();
+    let mut out = BTreeMap::new();
+    for (name, entry) in file.workspaces {
+        if let Some(prev) = seen.insert((entry.host.clone(), entry.root.clone()), name.clone()) {
+            anyhow::bail!(
+                "workspaces '{prev}' and '{name}' address the same host and root; \
+                 they would contend for the same server state lock"
+            );
+        }
+        let bin = entry.bin.unwrap_or_else(|| "agent-remote-server".into());
+        let endpoint = match entry.host {
+            Some(host) => Endpoint::Ssh {
+                host,
+                remote_bin: bin,
+                root: entry.root,
+                state_base: entry.state_base,
+                config: entry.config,
+            },
+            None => Endpoint::Local {
+                server_bin: bin,
+                root: entry.root,
+                state_base: entry.state_base,
+                config: entry.config,
+            },
+        };
+        out.insert(name, endpoint);
+    }
+    Ok(out)
+}
+
 // ---- Helpers ----
 
 fn ok(text: impl Into<String>) -> CallToolResult {
@@ -23,10 +84,28 @@ fn err(text: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![Content::text(text)])
 }
 
+/// Serialize a result object with the workspace name injected, so the agent
+/// never has to guess which workspace an operation_id or path belongs to.
+fn ok_json_in_workspace<T: serde::Serialize>(workspace: &str, value: &T) -> CallToolResult {
+    let mut v = match serde_json::to_value(value) {
+        Ok(v) => v,
+        Err(e) => return err(format!("result serialize error: {e}")),
+    };
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("workspace".into(), workspace.into());
+    }
+    match serde_json::to_string_pretty(&v) {
+        Ok(text) => ok(text),
+        Err(e) => err(format!("result serialize error: {e}")),
+    }
+}
+
 // ---- Input structs ----
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListDirInput {
+    #[schemars(description = "Workspace name (see list_workspaces)")]
+    pub workspace: String,
     #[schemars(
         description = "Directory path relative to workspace, or @scratch/... for server-managed scratch"
     )]
@@ -39,6 +118,8 @@ pub struct ListDirInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadFileInput {
+    #[schemars(description = "Workspace name (see list_workspaces)")]
+    pub workspace: String,
     #[schemars(
         description = "File path relative to workspace, or @scratch/... for server-managed scratch"
     )]
@@ -51,6 +132,8 @@ pub struct ReadFileInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct StatInput {
+    #[schemars(description = "Workspace name (see list_workspaces)")]
+    pub workspace: String,
     #[schemars(
         description = "File or directory path relative to workspace, or @scratch/... for server-managed scratch"
     )]
@@ -59,6 +142,8 @@ pub struct StatInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WriteFileInput {
+    #[schemars(description = "Workspace name (see list_workspaces)")]
+    pub workspace: String,
     #[schemars(
         description = "File path relative to workspace, or @scratch/... for server-managed scratch"
     )]
@@ -73,6 +158,8 @@ pub struct WriteFileInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PatchFileInput {
+    #[schemars(description = "Workspace name (see list_workspaces)")]
+    pub workspace: String,
     #[schemars(
         description = "File path relative to workspace, or @scratch/... for server-managed scratch"
     )]
@@ -85,6 +172,8 @@ pub struct PatchFileInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeleteFileInput {
+    #[schemars(description = "Workspace name (see list_workspaces)")]
+    pub workspace: String,
     #[schemars(
         description = "File path relative to workspace, or @scratch/... for server-managed scratch"
     )]
@@ -93,6 +182,8 @@ pub struct DeleteFileInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RunCommandInput {
+    #[schemars(description = "Workspace name (see list_workspaces)")]
+    pub workspace: String,
     #[schemars(description = "Command and arguments, e.g. [\"pytest\", \"-q\"]")]
     pub argv: Vec<String>,
     #[schemars(
@@ -107,30 +198,40 @@ pub struct RunCommandInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct UndoInput {
+    #[schemars(description = "Workspace name the operation was recorded in")]
+    pub workspace: String,
     #[schemars(description = "Operation ID to undo (from write/patch/delete result)")]
     pub operation_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HistoryInput {
+    #[schemars(description = "Workspace name (see list_workspaces)")]
+    pub workspace: String,
     #[schemars(description = "Maximum operations to return (default: 50; maximum: 100)")]
     pub limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OperationGetInput {
+    #[schemars(description = "Workspace name the operation was recorded in")]
+    pub workspace: String,
     #[schemars(description = "Operation ID to look up")]
     pub operation_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RequestStatusInput {
+    #[schemars(description = "Workspace name the request was issued against")]
+    pub workspace: String,
     #[schemars(description = "Request ID whose status to query")]
     pub request_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct UploadFileInput {
+    #[schemars(description = "Destination workspace name (see list_workspaces)")]
+    pub workspace: String,
     #[schemars(description = "Absolute or relative path of the local source file")]
     pub local_path: String,
     #[schemars(
@@ -143,6 +244,8 @@ pub struct UploadFileInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DownloadFileInput {
+    #[schemars(description = "Source workspace name (see list_workspaces)")]
+    pub workspace: String,
     #[schemars(
         description = "Source path relative to workspace, or @scratch/... for server-managed scratch"
     )]
@@ -155,36 +258,64 @@ pub struct DownloadFileInput {
 
 // ---- MCP server ----
 
-pub struct RemoteWorkspaceServer {
-    /// Where the server runs; source of the control-plane argv used to
-    /// (re)spawn the transport and of the raw transfer argvs.
+/// One configured workspace: its endpoint plus an independent connection
+/// slot, so an unreachable machine's connect retries never block calls to the
+/// other workspaces.
+struct WorkspaceHandle {
     endpoint: Endpoint,
     /// Current connection. A Client never recovers once its transport dies
     /// (e.g. sshd resetting the connection), so tool calls fetch it through
     /// `client()`, which reconnects on demand.
-    client_slot: tokio::sync::Mutex<Option<Arc<Client>>>,
+    slot: tokio::sync::Mutex<Option<Arc<Client>>>,
+}
+
+pub struct RemoteWorkspaceServer {
+    /// Immutable after startup: the fleet is fixed for the process lifetime.
+    workspaces: BTreeMap<String, WorkspaceHandle>,
 }
 
 const CONNECT_ATTEMPTS: u32 = 4;
 const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl RemoteWorkspaceServer {
-    pub fn new(endpoint: Endpoint) -> Self {
-        Self {
-            endpoint,
-            client_slot: tokio::sync::Mutex::new(None),
-        }
+    pub fn new(fleet: BTreeMap<String, Endpoint>) -> Self {
+        let workspaces = fleet
+            .into_iter()
+            .map(|(name, endpoint)| {
+                (
+                    name,
+                    WorkspaceHandle {
+                        endpoint,
+                        slot: tokio::sync::Mutex::new(None),
+                    },
+                )
+            })
+            .collect();
+        Self { workspaces }
     }
 
-    /// Returns a live client, (re)connecting with retries if there is none or
-    /// the previous connection died. A fresh connection is probed with a real
-    /// round-trip, because a transport can spawn fine and die immediately
-    /// (e.g. sshd resetting rapid successive connections).
-    async fn client(&self) -> Result<Arc<Client>, String> {
-        let mut slot = self.client_slot.lock().await;
+    fn handle(&self, workspace: &str) -> Result<&WorkspaceHandle, String> {
+        self.workspaces.get(workspace).ok_or_else(|| {
+            let names = self
+                .workspaces
+                .keys()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("unknown workspace '{workspace}'; available workspaces: {names}")
+        })
+    }
+
+    /// Returns a live client for the workspace, (re)connecting with retries if
+    /// there is none or the previous connection died. A fresh connection is
+    /// probed with a real round-trip, because a transport can spawn fine and
+    /// die immediately (e.g. sshd resetting rapid successive connections).
+    async fn client(&self, workspace: &str) -> Result<(Arc<Client>, &WorkspaceHandle), String> {
+        let handle = self.handle(workspace)?;
+        let mut slot = handle.slot.lock().await;
         if let Some(c) = slot.as_ref() {
             if !c.is_closed() {
-                return Ok(c.clone());
+                return Ok((c.clone(), handle));
             }
         }
         let mut last = String::new();
@@ -193,14 +324,14 @@ impl RemoteWorkspaceServer {
                 tokio::time::sleep(CONNECT_BACKOFF).await;
             }
             let transport = agent_remote_client::ArgvTransport {
-                argv: self.endpoint.control_argv(),
+                argv: handle.endpoint.control_argv(),
             };
             match Client::connect(transport, None).await {
                 Ok(c) => match c.stat(".").await {
                     Ok(_) => {
                         let c = Arc::new(c);
                         *slot = Some(c.clone());
-                        return Ok(c);
+                        return Ok((c, handle));
                     }
                     Err(e) => last = format!("attempt {attempt}: connection probe failed: {e}"),
                 },
@@ -208,23 +339,45 @@ impl RemoteWorkspaceServer {
             }
         }
         Err(format!(
-            "cannot reach the remote workspace after {CONNECT_ATTEMPTS} attempts ({last})"
+            "cannot reach workspace '{workspace}' after {CONNECT_ATTEMPTS} attempts ({last})"
         ))
     }
 }
 
 #[tool_router]
 impl RemoteWorkspaceServer {
-    #[tool(description = "List the contents of a directory in the remote workspace.")]
+    #[tool(
+        description = "List the configured workspaces: name, host, and root directory. Every other tool requires one of these names as its workspace argument."
+    )]
+    async fn list_workspaces(&self) -> CallToolResult {
+        let rows: Vec<serde_json::Value> = self
+            .workspaces
+            .iter()
+            .map(|(name, h)| {
+                let (host, root) = match &h.endpoint {
+                    Endpoint::Ssh { host, root, .. } => (host.as_str(), root.as_str()),
+                    Endpoint::Local { root, .. } => ("(local)", root.as_str()),
+                };
+                serde_json::json!({"name": name, "host": host, "root": root})
+            })
+            .collect();
+        match serde_json::to_string_pretty(&rows) {
+            Ok(text) => ok(text),
+            Err(e) => err(format!("serialize error: {e}")),
+        }
+    }
+
+    #[tool(description = "List the contents of a directory in a workspace.")]
     async fn list_dir(
         &self,
         Parameters(ListDirInput {
+            workspace,
             path,
             offset,
             limit,
         }): Parameters<ListDirInput>,
     ) -> CallToolResult {
-        let client = match self.client().await {
+        let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
@@ -261,12 +414,13 @@ impl RemoteWorkspaceServer {
     async fn read_file(
         &self,
         Parameters(ReadFileInput {
+            workspace,
             path,
             offset,
             limit,
         }): Parameters<ReadFileInput>,
     ) -> CallToolResult {
-        let client = match self.client().await {
+        let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
@@ -288,14 +442,16 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(description = "Get metadata for a file or directory: type, size, hash, permissions.")]
-    async fn stat(&self, Parameters(StatInput { path }): Parameters<StatInput>) -> CallToolResult {
-        let client = match self.client().await {
+    async fn stat(
+        &self,
+        Parameters(StatInput { workspace, path }): Parameters<StatInput>,
+    ) -> CallToolResult {
+        let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
         match client.stat(&path).await {
-            Ok(s) => ok(serde_json::to_string_pretty(&s)
-                .unwrap_or_else(|e| format!("stat ok, serialize error: {e}"))),
+            Ok(s) => ok_json_in_workspace(&workspace, &s),
             Err(e) => err(format!("{e}")),
         }
     }
@@ -306,18 +462,19 @@ impl RemoteWorkspaceServer {
     async fn write_file(
         &self,
         Parameters(WriteFileInput {
+            workspace,
             path,
             content,
             base_hash,
         }): Parameters<WriteFileInput>,
     ) -> CallToolResult {
-        let client = match self.client().await {
+        let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
         match client.write(&path, &content, base_hash.as_deref()).await {
             Ok(w) => ok(format!(
-                "Wrote {path}. operation_id={}, new_hash={}",
+                "Wrote {path} in workspace '{workspace}'. operation_id={}, new_hash={}",
                 w.operation_id, w.new_hash
             )),
             Err(e) => err(format!("{e}")),
@@ -330,18 +487,19 @@ impl RemoteWorkspaceServer {
     async fn patch_file(
         &self,
         Parameters(PatchFileInput {
+            workspace,
             path,
             base_hash,
             patch,
         }): Parameters<PatchFileInput>,
     ) -> CallToolResult {
-        let client = match self.client().await {
+        let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
         match client.patch(&path, &base_hash, &patch).await {
             Ok(w) => ok(format!(
-                "Patched {path}. operation_id={}, new_hash={}",
+                "Patched {path} in workspace '{workspace}'. operation_id={}, new_hash={}",
                 w.operation_id, w.new_hash
             )),
             Err(e) => err(format!("{e}")),
@@ -351,62 +509,63 @@ impl RemoteWorkspaceServer {
     #[tool(description = "Delete a file. Recorded in the operation log and can be undone.")]
     async fn delete_file(
         &self,
-        Parameters(DeleteFileInput { path }): Parameters<DeleteFileInput>,
+        Parameters(DeleteFileInput { workspace, path }): Parameters<DeleteFileInput>,
     ) -> CallToolResult {
-        let client = match self.client().await {
+        let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
         match client.delete(&path).await {
-            Ok(w) => ok(format!("Deleted {path}. operation_id={}", w.operation_id)),
+            Ok(w) => ok(format!(
+                "Deleted {path} in workspace '{workspace}'. operation_id={}",
+                w.operation_id
+            )),
             Err(e) => err(format!("{e}")),
         }
     }
 
     #[tool(
-        description = "Run a command synchronously. Returns termination, duration, and a fixed-size preview of each output stream (first 4 KiB and last 12 KiB). Redirect full output to $AGENT_REMOTE_SCRATCH and read it through @scratch/... when needed."
+        description = "Run a command synchronously in a workspace. Returns termination, duration, and a fixed-size preview of each output stream (first 4 KiB and last 12 KiB). Redirect full output to $AGENT_REMOTE_SCRATCH and read it through @scratch/... when needed."
     )]
     async fn run_command(
         &self,
         Parameters(RunCommandInput {
+            workspace,
             argv,
             cwd,
             profile,
             timeout_ms,
         }): Parameters<RunCommandInput>,
     ) -> CallToolResult {
-        let client = match self.client().await {
+        let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
-        let result = client.exec(argv, cwd, profile, timeout_ms).await;
-        match result {
-            Ok(result) => match serde_json::to_string_pretty(&result) {
-                Ok(text) => ok(text),
-                Err(e) => err(format!("could not serialize command result: {e}")),
-            },
+        match client.exec(argv, cwd, profile, timeout_ms).await {
+            Ok(result) => ok_json_in_workspace(&workspace, &result),
             Err(e) => err(format!("{e}")),
         }
     }
 
     #[tool(
-        description = "Upload one local regular file to the remote workspace as raw streamed bytes; the file content never enters the model context, so use this (not write_file or shell tricks) for binary or large files. remote_path is workspace-relative or @scratch/...; its parent directory must already exist. Synchronous: the call returns only when the file is fully installed remotely, so a long-running call is normal for big files. Existing destinations are never replaced unless overwrite=true."
+        description = "Upload one local regular file to a workspace as raw streamed bytes; the file content never enters the model context, so use this (not write_file or shell tricks) for binary or large files. remote_path is workspace-relative or @scratch/...; its parent directory must already exist. Synchronous: the call returns only when the file is fully installed remotely, so a long-running call is normal for big files. Existing destinations are never replaced unless overwrite=true."
     )]
     async fn upload_file(
         &self,
         Parameters(UploadFileInput {
+            workspace,
             local_path,
             remote_path,
             overwrite,
         }): Parameters<UploadFileInput>,
     ) -> CallToolResult {
-        let client = match self.client().await {
+        let (client, handle) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
         match agent_remote_client::upload_file(
             &client,
-            &self.endpoint,
+            &handle.endpoint,
             std::path::Path::new(&local_path),
             &remote_path,
             overwrite.unwrap_or(false),
@@ -414,30 +573,30 @@ impl RemoteWorkspaceServer {
         )
         .await
         {
-            Ok(r) => ok(serde_json::to_string_pretty(&r)
-                .unwrap_or_else(|e| format!("upload ok, serialize error: {e}"))),
+            Ok(r) => ok_json_in_workspace(&workspace, &r),
             Err(e) => err(format!("{e}")),
         }
     }
 
     #[tool(
-        description = "Download one remote regular file to the local machine as raw streamed bytes; the file content never enters the model context, so use this (not read_file) for binary or large files. remote_path is workspace-relative or @scratch/...; the local parent directory must already exist. Synchronous: the call returns only when the file is fully installed locally, so a long-running call is normal for big files. Existing destinations are never replaced unless overwrite=true."
+        description = "Download one remote regular file from a workspace to the local machine as raw streamed bytes; the file content never enters the model context, so use this (not read_file) for binary or large files. remote_path is workspace-relative or @scratch/...; the local parent directory must already exist. Synchronous: the call returns only when the file is fully installed locally, so a long-running call is normal for big files. Existing destinations are never replaced unless overwrite=true."
     )]
     async fn download_file(
         &self,
         Parameters(DownloadFileInput {
+            workspace,
             remote_path,
             local_path,
             overwrite,
         }): Parameters<DownloadFileInput>,
     ) -> CallToolResult {
-        let client = match self.client().await {
+        let (client, handle) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
         match agent_remote_client::download_file(
             &client,
-            &self.endpoint,
+            &handle.endpoint,
             &remote_path,
             std::path::Path::new(&local_path),
             overwrite.unwrap_or(false),
@@ -449,27 +608,29 @@ impl RemoteWorkspaceServer {
                 // For a download the useful path is the local destination; the
                 // server-side record keeps the remote logical path.
                 r.path = local_path;
-                ok(serde_json::to_string_pretty(&r)
-                    .unwrap_or_else(|e| format!("download ok, serialize error: {e}")))
+                ok_json_in_workspace(&workspace, &r)
             }
             Err(e) => err(format!("{e}")),
         }
     }
 
     #[tool(
-        description = "Undo a recorded file operation. Only works if the file has not been modified since."
+        description = "Undo a recorded file operation. Only works if the file has not been modified since. Operation IDs are scoped to one workspace; pass the workspace the operation was recorded in."
     )]
     async fn undo(
         &self,
-        Parameters(UndoInput { operation_id }): Parameters<UndoInput>,
+        Parameters(UndoInput {
+            workspace,
+            operation_id,
+        }): Parameters<UndoInput>,
     ) -> CallToolResult {
-        let client = match self.client().await {
+        let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
         match client.undo(&operation_id).await {
             Ok(u) => ok(format!(
-                "Undid target {operation_id}; undo_operation_id={}, new_hash={}",
+                "Undid target {operation_id} in workspace '{workspace}'; undo_operation_id={}, new_hash={}",
                 u.operation_id, u.new_hash
             )),
             Err(e) => err(format!("{e}")),
@@ -477,20 +638,22 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Show the history of recorded operations (file mutations and exec invocations)."
+        description = "Show the history of operations recorded in one workspace (file mutations, exec invocations, transfers)."
     )]
     async fn history(
         &self,
-        Parameters(HistoryInput { limit }): Parameters<HistoryInput>,
+        Parameters(HistoryInput { workspace, limit }): Parameters<HistoryInput>,
     ) -> CallToolResult {
-        let client = match self.client().await {
+        let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
         match client.history(limit).await {
             Ok(ops) => {
                 if ops.is_empty() {
-                    return ok("(no operations recorded)");
+                    return ok(format!(
+                        "(no operations recorded in workspace '{workspace}')"
+                    ));
                 }
                 let out = ops
                     .iter()
@@ -503,34 +666,40 @@ impl RemoteWorkspaceServer {
         }
     }
 
-    #[tool(description = "Get details of a specific operation by ID.")]
+    #[tool(description = "Get details of a specific operation by ID, within one workspace.")]
     async fn operation_get(
         &self,
-        Parameters(OperationGetInput { operation_id }): Parameters<OperationGetInput>,
+        Parameters(OperationGetInput {
+            workspace,
+            operation_id,
+        }): Parameters<OperationGetInput>,
     ) -> CallToolResult {
-        let client = match self.client().await {
+        let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
         match client.operation_get(&operation_id).await {
-            Ok(d) => ok(serde_json::to_string_pretty(&d)
-                .unwrap_or_else(|e| format!("serialize error: {e}"))),
+            Ok(d) => ok_json_in_workspace(&workspace, &d),
             Err(e) => err(format!("{e}")),
         }
     }
 
-    #[tool(description = "Query the status of a previously-issued request by request ID.")]
+    #[tool(
+        description = "Query the status of a previously-issued request by request ID, within one workspace."
+    )]
     async fn request_status(
         &self,
-        Parameters(RequestStatusInput { request_id }): Parameters<RequestStatusInput>,
+        Parameters(RequestStatusInput {
+            workspace,
+            request_id,
+        }): Parameters<RequestStatusInput>,
     ) -> CallToolResult {
-        let client = match self.client().await {
+        let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
         match client.request_status(&request_id).await {
-            Ok(r) => ok(serde_json::to_string_pretty(&r)
-                .unwrap_or_else(|e| format!("serialize error: {e}"))),
+            Ok(r) => ok_json_in_workspace(&workspace, &r),
             Err(e) => err(format!("{e}")),
         }
     }

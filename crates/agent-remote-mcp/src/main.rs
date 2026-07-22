@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use agent_remote_mcp::RemoteWorkspaceServer;
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -8,33 +10,13 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "agent-remote-mcp",
     version,
-    about = "MCP server exposing remote workspace tools over agent-remote"
+    about = "MCP server exposing named agent-remote workspaces"
 )]
 struct Cli {
-    /// SSH host (resolvable via ~/.ssh/config). Required unless --local.
+    /// Path to the fleet config (TOML) declaring the workspaces. Defaults to
+    /// ~/.agent-remote/workspaces.toml.
     #[arg(long)]
-    host: Option<String>,
-
-    /// Path to the remote `agent-remote-server` binary.
-    #[arg(long, default_value = "agent-remote-server")]
-    remote_bin: String,
-
-    /// Workspace root on the remote host.
-    #[arg(long)]
-    root: String,
-
-    /// Run the server locally (no SSH). --remote-bin must be a local path.
-    #[arg(long)]
-    local: bool,
-
-    /// Optional remote config TOML path.
-    #[arg(long)]
-    config: Option<String>,
-
-    /// Optional base directory for server state instead of ~/.agent-remote on
-    /// the remote (state still keyed per workspace under <base>/state/).
-    #[arg(long)]
-    state_base: Option<String>,
+    fleet: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -46,31 +28,24 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let endpoint = if cli.local {
-        agent_remote_client::Endpoint::Local {
-            server_bin: cli.remote_bin,
-            root: cli.root,
-            state_base: cli.state_base,
-            config: cli.config,
-        }
-    } else {
-        let host = cli
-            .host
-            .ok_or_else(|| anyhow!("--host is required (or use --local)"))?;
-        agent_remote_client::Endpoint::Ssh {
-            host,
-            remote_bin: cli.remote_bin,
-            root: cli.root,
-            state_base: cli.state_base,
-            config: cli.config,
+    let fleet_path = match cli.fleet {
+        Some(p) => p,
+        None => {
+            let home =
+                std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set; pass --fleet"))?;
+            PathBuf::from(home).join(".agent-remote/workspaces.toml")
         }
     };
+    let text = std::fs::read_to_string(&fleet_path)
+        .with_context(|| format!("read fleet config {fleet_path:?}; create it or pass --fleet"))?;
+    let fleet = agent_remote_mcp::parse_fleet(&text)
+        .with_context(|| format!("invalid fleet config {fleet_path:?}"))?;
 
     // No eager connect: initialize must answer immediately (a blocking retry
     // loop here makes the MCP host time the server out, e.g. when a session
     // being resumed briefly overlaps its predecessor on the same state lock).
-    // The first tool call connects on demand.
-    let server = RemoteWorkspaceServer::new(endpoint);
+    // The first tool call to each workspace connects on demand.
+    let server = RemoteWorkspaceServer::new(fleet);
     let service = server
         .serve(rmcp::transport::stdio())
         .await

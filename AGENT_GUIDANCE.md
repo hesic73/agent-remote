@@ -1,5 +1,7 @@
 # Agent guidance
 
+This server manages one or more named workspaces, each a directory on a configured machine. Every tool except `list_workspaces` requires a `workspace` argument naming which one to act on; call `list_workspaces` to see the available names. Workspaces are fully isolated from each other: paths, operation IDs, history, undo, and request IDs are scoped to a single workspace and mean nothing in another. Transfers move files between the local machine and one workspace; to move data between two workspaces, download to a local file and upload it.
+
 Use the file tools for workspace reads and mutations. Use `run_command` for builds, tests, searches, and process management.
 
 File reads and directory listings are bounded. Follow `next_offset` or the returned offset notice to retrieve another page instead of requesting unbounded output.

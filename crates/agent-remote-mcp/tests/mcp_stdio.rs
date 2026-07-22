@@ -13,6 +13,16 @@ fn server_bin() -> String {
     p.to_string_lossy().into_owned()
 }
 
+/// A local fleet entry named `name` for `root`, with server state kept inside
+/// the root instead of the real HOME.
+fn fleet_entry(name: &str, root: &str) -> String {
+    format!(
+        "[workspaces.{name}]\nroot = {root:?}\nbin = {srv:?}\nstate_base = {state:?}\n",
+        srv = server_bin(),
+        state = format!("{root}/.agent-remote-test"),
+    )
+}
+
 struct McpSession {
     child: Child,
     stdin: ChildStdin,
@@ -21,7 +31,14 @@ struct McpSession {
 }
 
 impl McpSession {
+    /// Single-workspace session: workspace "test" serving `root`.
     fn spawn(root: &str) -> Self {
+        let fleet = std::path::Path::new(root).join(".fleet.toml");
+        std::fs::write(&fleet, fleet_entry("test", root)).unwrap();
+        Self::spawn_fleet(&fleet)
+    }
+
+    fn spawn_fleet(fleet_path: &std::path::Path) -> Self {
         let srv = server_bin();
         assert!(
             std::path::Path::new(&srv).exists(),
@@ -32,11 +49,8 @@ impl McpSession {
             std::path::Path::new(&mcp).exists(),
             "mcp binary not found at {mcp}"
         );
-        // Keep server state inside the test tempdir instead of the real HOME.
-        let state = format!("{root}/.agent-remote-test");
         let mut child = Command::new(&mcp)
-            .args(["--local", "--remote-bin", &srv, "--root", root])
-            .args(["--state-base", &state])
+            .args(["--fleet", &fleet_path.to_string_lossy()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -50,6 +64,18 @@ impl McpSession {
             stdout,
             id: 0,
         }
+    }
+
+    fn initialize(&mut self) {
+        self.call(
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0.1"},
+            }),
+        );
+        self.notify("notifications/initialized", serde_json::json!({}));
     }
 
     fn call(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
@@ -89,6 +115,19 @@ impl McpSession {
         }
         v
     }
+
+    fn tool(&mut self, name: &str, args: serde_json::Value) -> (bool, String) {
+        let resp = self.call(
+            "tools/call",
+            serde_json::json!({"name": name, "arguments": args}),
+        );
+        let is_err = resp["result"]["isError"].as_bool().unwrap();
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        (is_err, text)
+    }
 }
 
 impl Drop for McpSession {
@@ -103,7 +142,6 @@ fn mcp_initialize_and_server_info() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = McpSession::spawn(dir.path().to_str().unwrap());
 
-    // initialize
     let resp = s.call(
         "initialize",
         serde_json::json!({
@@ -123,29 +161,53 @@ fn mcp_initialize_and_server_info() {
     ] {
         assert!(doc.contains("AGENT_GUIDANCE.md"));
     }
-    // Send initialized notification.
     s.notify("notifications/initialized", serde_json::json!({}));
+}
+
+#[test]
+fn mcp_rejects_invalid_fleet_configs() {
+    let dir = tempfile::tempdir().unwrap();
+    let cases = [
+        ("empty", "".to_string()),
+        (
+            "duplicate",
+            format!(
+                "{}{}",
+                fleet_entry("a", dir.path().to_str().unwrap()),
+                fleet_entry("b", dir.path().to_str().unwrap())
+            ),
+        ),
+        (
+            "unknown-field",
+            "[workspaces.x]\nroot = \"/tmp\"\nhostt = \"typo\"\n".into(),
+        ),
+    ];
+    for (label, content) in cases {
+        let fleet = dir.path().join(format!("{label}.toml"));
+        std::fs::write(&fleet, content).unwrap();
+        let out = Command::new(mcp_bin())
+            .args(["--fleet", &fleet.to_string_lossy()])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "{label} fleet config must be rejected at startup"
+        );
+    }
 }
 
 #[test]
 fn mcp_tools_list_has_expected_tools() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = McpSession::spawn(dir.path().to_str().unwrap());
-
-    s.call(
-        "initialize",
-        serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "test", "version": "0.1"},
-        }),
-    );
-    s.notify("notifications/initialized", serde_json::json!({}));
+    s.initialize();
 
     let resp = s.call("tools/list", serde_json::json!({}));
     let tools = resp["result"]["tools"].as_array().expect("tools array");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     let expected = [
+        "list_workspaces",
         "list_dir",
         "read_file",
         "stat",
@@ -164,67 +226,54 @@ fn mcp_tools_list_has_expected_tools() {
         assert!(names.contains(&tool), "missing tool {tool}; have {names:?}");
     }
     assert_eq!(names.len(), expected.len(), "unexpected tools: {names:?}");
+
+    // Every tool except list_workspaces requires the workspace argument.
+    for t in tools {
+        let name = t["name"].as_str().unwrap();
+        let required: Vec<&str> = t["inputSchema"]["required"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        if name == "list_workspaces" {
+            assert!(!required.contains(&"workspace"), "{name}");
+        } else {
+            assert!(
+                required.contains(&"workspace"),
+                "{name} must require workspace, requires {required:?}"
+            );
+        }
+    }
 }
 
 #[test]
 fn mcp_tool_call_success_is_not_error() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = McpSession::spawn(dir.path().to_str().unwrap());
+    s.initialize();
 
-    s.call(
-        "initialize",
-        serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "test", "version": "0.1"},
-        }),
+    let (e, text) = s.tool(
+        "write_file",
+        serde_json::json!({"workspace": "test", "path": "test.txt", "content": "hello\n"}),
     );
-    s.notify("notifications/initialized", serde_json::json!({}));
-
-    // write_file should succeed.
-    let resp = s.call(
-        "tools/call",
-        serde_json::json!({
-            "name": "write_file",
-            "arguments": {"path": "test.txt", "content": "hello\n"},
-        }),
-    );
-    assert_eq!(
-        resp["result"]["isError"], false,
-        "write should not be an error"
-    );
-    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(!e, "write should not be an error: {text}");
     assert!(text.contains("Wrote test.txt"), "unexpected text: {text}");
+    assert!(
+        text.contains("workspace 'test'"),
+        "result must echo the workspace: {text}"
+    );
 }
 
 #[test]
 fn mcp_tool_call_failure_is_error() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = McpSession::spawn(dir.path().to_str().unwrap());
+    s.initialize();
 
-    s.call(
-        "initialize",
-        serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "test", "version": "0.1"},
-        }),
+    let (e, text) = s.tool(
+        "read_file",
+        serde_json::json!({"workspace": "test", "path": "missing.txt"}),
     );
-    s.notify("notifications/initialized", serde_json::json!({}));
-
-    // read_file on a non-existent file must return isError=true.
-    let resp = s.call(
-        "tools/call",
-        serde_json::json!({
-            "name": "read_file",
-            "arguments": {"path": "missing.txt"},
-        }),
-    );
-    assert_eq!(
-        resp["result"]["isError"], true,
-        "reading a missing file must be isError=true"
-    );
-    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(e, "reading a missing file must be isError=true");
     assert!(
         text.contains("NotFound"),
         "error text should mention the error: {text}"
@@ -232,33 +281,95 @@ fn mcp_tool_call_failure_is_error() {
 }
 
 #[test]
+fn mcp_unknown_workspace_is_a_clear_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = McpSession::spawn(dir.path().to_str().unwrap());
+    s.initialize();
+
+    let (e, text) = s.tool(
+        "stat",
+        serde_json::json!({"workspace": "nope", "path": "."}),
+    );
+    assert!(e, "unknown workspace must be isError=true");
+    assert!(
+        text.contains("unknown workspace 'nope'") && text.contains("test"),
+        "error must name the bad workspace and list the available ones: {text}"
+    );
+}
+
+#[test]
 fn mcp_run_command_returns_exit_code() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = McpSession::spawn(dir.path().to_str().unwrap());
+    s.initialize();
 
-    s.call(
-        "initialize",
-        serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "test", "version": "0.1"},
-        }),
+    let (e, text) = s.tool(
+        "run_command",
+        serde_json::json!({"workspace": "test", "argv": ["echo", "hello-from-mcp"]}),
     );
-    s.notify("notifications/initialized", serde_json::json!({}));
-
-    let resp = s.call(
-        "tools/call",
-        serde_json::json!({
-            "name": "run_command",
-            "arguments": {"argv": ["echo", "hello-from-mcp"]},
-        }),
-    );
-    assert_eq!(resp["result"]["isError"], false);
-    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(!e);
     assert!(text.contains("hello-from-mcp"), "stdout missing: {text}");
-    let result: serde_json::Value = serde_json::from_str(text).unwrap();
+    let result: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(result["termination"]["kind"], "exited");
     assert_eq!(result["termination"]["code"], 0);
+    assert_eq!(result["workspace"], "test");
+}
+
+// Two workspaces in one fleet are fully isolated: files, history, and
+// operation ids live per workspace.
+#[test]
+fn mcp_workspaces_are_isolated() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let fleet = dir_a.path().join(".fleet.toml");
+    std::fs::write(
+        &fleet,
+        format!(
+            "{}{}",
+            fleet_entry("a", dir_a.path().to_str().unwrap()),
+            fleet_entry("b", dir_b.path().to_str().unwrap())
+        ),
+    )
+    .unwrap();
+    let mut s = McpSession::spawn_fleet(&fleet);
+    s.initialize();
+
+    let (e, text) = s.tool("list_workspaces", serde_json::json!({}));
+    assert!(!e);
+    let rows: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let names: Vec<&str> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["a", "b"]);
+    assert_eq!(rows[0]["host"], "(local)");
+    assert_eq!(rows[0]["root"], dir_a.path().to_str().unwrap());
+
+    let (e, _) = s.tool(
+        "write_file",
+        serde_json::json!({"workspace": "a", "path": "only-in-a.txt", "content": "x"}),
+    );
+    assert!(!e);
+    assert!(dir_a.path().join("only-in-a.txt").exists());
+    assert!(!dir_b.path().join("only-in-a.txt").exists());
+
+    let (e, _) = s.tool(
+        "read_file",
+        serde_json::json!({"workspace": "b", "path": "only-in-a.txt"}),
+    );
+    assert!(e, "workspace b must not see a's file");
+
+    let (e, text) = s.tool("history", serde_json::json!({"workspace": "b"}));
+    assert!(!e);
+    assert!(
+        text.contains("no operations recorded"),
+        "b's history must be empty: {text}"
+    );
+    let (e, text) = s.tool("history", serde_json::json!({"workspace": "a"}));
+    assert!(!e);
+    assert!(text.contains("only-in-a.txt"), "a's history: {text}");
 }
 
 // Drive every remaining tool over real MCP stdio: stat, patch_file,
@@ -267,46 +378,27 @@ fn mcp_run_command_returns_exit_code() {
 fn mcp_full_tool_surface() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = McpSession::spawn(dir.path().to_str().unwrap());
-    s.call(
-        "initialize",
-        serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "test", "version": "0.1"},
-        }),
-    );
-    s.notify("notifications/initialized", serde_json::json!({}));
+    s.initialize();
 
-    let tool = |s: &mut McpSession, name: &str, args: serde_json::Value| -> (bool, String) {
-        let resp = s.call(
-            "tools/call",
-            serde_json::json!({"name": name, "arguments": args}),
-        );
-        let is_err = resp["result"]["isError"].as_bool().unwrap();
-        let text = resp["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        (is_err, text)
-    };
-
-    let (e, _) = tool(
-        &mut s,
+    let (e, _) = s.tool(
         "write_file",
-        serde_json::json!({"path": "f.txt", "content": "l1\nl2\n"}),
+        serde_json::json!({"workspace": "test", "path": "f.txt", "content": "l1\nl2\n"}),
     );
     assert!(!e);
 
-    // stat returns the hash we need for patching.
-    let (e, text) = tool(&mut s, "stat", serde_json::json!({"path": "f.txt"}));
+    // stat returns the hash we need for patching, and echoes the workspace.
+    let (e, text) = s.tool(
+        "stat",
+        serde_json::json!({"workspace": "test", "path": "f.txt"}),
+    );
     assert!(!e, "stat failed: {text}");
     let stat: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(stat["workspace"], "test");
     let hash = stat["hash"].as_str().unwrap().to_string();
 
-    let (e, text) = tool(
-        &mut s,
+    let (e, text) = s.tool(
         "patch_file",
-        serde_json::json!({"path": "f.txt", "base_hash": hash, "patch": "2c L2"}),
+        serde_json::json!({"workspace": "test", "path": "f.txt", "base_hash": hash, "patch": "2c L2"}),
     );
     assert!(!e, "patch failed: {text}");
     let patch_op = text
@@ -318,47 +410,56 @@ fn mcp_full_tool_surface() {
         .unwrap()
         .to_string();
 
-    let (e, text) = tool(&mut s, "read_file", serde_json::json!({"path": "f.txt"}));
+    let (e, text) = s.tool(
+        "read_file",
+        serde_json::json!({"workspace": "test", "path": "f.txt"}),
+    );
     assert!(!e);
     assert!(text.starts_with("l1\nL2\n"), "patch not applied: {text}");
 
     // Undo the patch.
-    let (e, text) = tool(
-        &mut s,
+    let (e, text) = s.tool(
         "undo",
-        serde_json::json!({"operation_id": patch_op}),
+        serde_json::json!({"workspace": "test", "operation_id": patch_op}),
     );
     assert!(!e, "undo failed: {text}");
-    let (_, text) = tool(&mut s, "read_file", serde_json::json!({"path": "f.txt"}));
+    let (_, text) = s.tool(
+        "read_file",
+        serde_json::json!({"workspace": "test", "path": "f.txt"}),
+    );
     assert!(text.starts_with("l1\nl2\n"), "undo not applied: {text}");
 
     // Delete, then verify it is gone.
-    let (e, text) = tool(&mut s, "delete_file", serde_json::json!({"path": "f.txt"}));
+    let (e, text) = s.tool(
+        "delete_file",
+        serde_json::json!({"workspace": "test", "path": "f.txt"}),
+    );
     assert!(!e, "delete failed: {text}");
     assert!(!dir.path().join("f.txt").exists());
-    let (e, _) = tool(&mut s, "read_file", serde_json::json!({"path": "f.txt"}));
+    let (e, _) = s.tool(
+        "read_file",
+        serde_json::json!({"workspace": "test", "path": "f.txt"}),
+    );
     assert!(e, "reading a deleted file must be an error");
 
     // History shows all four operations; operation_get resolves the patch op.
-    let (e, text) = tool(&mut s, "history", serde_json::json!({}));
+    let (e, text) = s.tool("history", serde_json::json!({"workspace": "test"}));
     assert!(!e);
     assert!(
         text.contains("\"delete\""),
         "history missing delete: {text}"
     );
-    let (e, text) = tool(
-        &mut s,
+    let (e, text) = s.tool(
         "operation_get",
-        serde_json::json!({"operation_id": patch_op}),
+        serde_json::json!({"workspace": "test", "operation_id": patch_op}),
     );
     assert!(!e, "operation_get failed: {text}");
     assert!(text.contains(&patch_op));
 
     // request_status on an unknown id reports unknown, not an error.
-    let (e, text) = tool(
-        &mut s,
+    let (e, text) = s.tool(
         "request_status",
-        serde_json::json!({"request_id": "never-existed"}),
+        serde_json::json!({"workspace": "test", "request_id": "never-existed"}),
     );
     assert!(!e, "request_status failed: {text}");
     assert!(text.contains("unknown"), "unexpected status: {text}");
@@ -372,36 +473,16 @@ fn mcp_reconnects_after_server_death() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     let mut s = McpSession::spawn(root);
-    s.call(
-        "initialize",
-        serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "test", "version": "0.1"},
-        }),
+    s.initialize();
+
+    let (e, _) = s.tool(
+        "list_dir",
+        serde_json::json!({"workspace": "test", "path": "."}),
     );
-    s.notify("notifications/initialized", serde_json::json!({}));
-
-    let list = |s: &mut McpSession| -> (bool, String) {
-        let resp = s.call(
-            "tools/call",
-            serde_json::json!({"name": "list_dir", "arguments": {"path": "."}}),
-        );
-        (
-            resp["result"]["isError"].as_bool().unwrap(),
-            resp["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .to_string(),
-        )
-    };
-
-    let (e, _) = list(&mut s);
     assert!(!e, "first call must succeed");
 
     // Kill the underlying server process. Anchored so it matches only the
-    // server itself, not the MCP process whose argv also contains this text
-    // (via --remote-bin/--root).
+    // server itself, not the MCP process whose argv also contains this text.
     let killed = std::process::Command::new("pkill")
         .args(["-f", &format!("^{} --root {root}", server_bin())])
         .status()
@@ -410,7 +491,10 @@ fn mcp_reconnects_after_server_death() {
     // Give the MCP's reader a moment to observe the EOF.
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    let (e, text) = list(&mut s);
+    let (e, text) = s.tool(
+        "list_dir",
+        serde_json::json!({"workspace": "test", "path": "."}),
+    );
     assert!(!e, "call after server death must reconnect, got: {text}");
 }
 
@@ -421,38 +505,17 @@ fn mcp_transfer_tools_roundtrip_and_errors() {
     let remote = tempfile::tempdir().unwrap();
     let local = tempfile::tempdir().unwrap();
     let mut s = McpSession::spawn(remote.path().to_str().unwrap());
-    s.call(
-        "initialize",
-        serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "test", "version": "0.1"},
-        }),
-    );
-    s.notify("notifications/initialized", serde_json::json!({}));
-
-    let tool = |s: &mut McpSession, name: &str, args: serde_json::Value| -> (bool, String) {
-        let resp = s.call(
-            "tools/call",
-            serde_json::json!({"name": name, "arguments": args}),
-        );
-        let is_err = resp["result"]["isError"].as_bool().unwrap();
-        let text = resp["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        (is_err, text)
-    };
+    s.initialize();
 
     // Binary content that read_file/write_file could not carry.
     let content: Vec<u8> = vec![0x00, 0xFF, 0xFE, 0x00, 0x42];
     let src = local.path().join("payload.bin");
     std::fs::write(&src, &content).unwrap();
 
-    let (e, text) = tool(
-        &mut s,
+    let (e, text) = s.tool(
         "upload_file",
         serde_json::json!({
+            "workspace": "test",
             "local_path": src.to_str().unwrap(),
             "remote_path": "payload.bin",
         }),
@@ -462,6 +525,7 @@ fn mcp_transfer_tools_roundtrip_and_errors() {
     assert_eq!(up["direction"], "upload");
     assert_eq!(up["path"], "payload.bin");
     assert_eq!(up["size"], content.len());
+    assert_eq!(up["workspace"], "test");
     assert!(up["operation_id"].as_str().unwrap().starts_with("op-"));
     assert!(up["sha256"].as_str().unwrap().starts_with("sha256:"));
     assert!(up["duration_ms"].is_u64());
@@ -475,10 +539,10 @@ fn mcp_transfer_tools_roundtrip_and_errors() {
     );
 
     // Default no-overwrite refuses the existing remote target.
-    let (e, text) = tool(
-        &mut s,
+    let (e, text) = s.tool(
         "upload_file",
         serde_json::json!({
+            "workspace": "test",
             "local_path": src.to_str().unwrap(),
             "remote_path": "payload.bin",
         }),
@@ -487,10 +551,10 @@ fn mcp_transfer_tools_roundtrip_and_errors() {
     assert!(text.contains("overwrite"), "unexpected text: {text}");
 
     let dest = local.path().join("payload-back.bin");
-    let (e, text) = tool(
-        &mut s,
+    let (e, text) = s.tool(
         "download_file",
         serde_json::json!({
+            "workspace": "test",
             "remote_path": "payload.bin",
             "local_path": dest.to_str().unwrap(),
         }),
@@ -500,13 +564,14 @@ fn mcp_transfer_tools_roundtrip_and_errors() {
     assert_eq!(down["direction"], "download");
     assert_eq!(down["path"], dest.to_str().unwrap());
     assert_eq!(down["sha256"], up["sha256"]);
+    assert_eq!(down["workspace"], "test");
     assert_eq!(std::fs::read(&dest).unwrap(), content);
 
     // Missing local source is a tool error, not a crash.
-    let (e, text) = tool(
-        &mut s,
+    let (e, text) = s.tool(
         "upload_file",
         serde_json::json!({
+            "workspace": "test",
             "local_path": local.path().join("missing.bin").to_str().unwrap(),
             "remote_path": "x.bin",
         }),
@@ -514,7 +579,7 @@ fn mcp_transfer_tools_roundtrip_and_errors() {
     assert!(e, "missing local source must be isError=true, got: {text}");
 
     // The transfer shows up in history as a metadata-only record.
-    let (e, text) = tool(&mut s, "history", serde_json::json!({}));
+    let (e, text) = s.tool("history", serde_json::json!({"workspace": "test"}));
     assert!(!e);
     assert!(
         text.contains("\"transfer\""),
