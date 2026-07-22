@@ -157,7 +157,9 @@ impl Client {
         })
     }
 
-    fn is_closed(&self) -> bool {
+    /// True once the transport has EOF'd. A closed Client never recovers;
+    /// callers that need resilience must build a fresh Client.
+    pub fn is_closed(&self) -> bool {
         self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -611,7 +613,20 @@ pub fn ssh_server_argv(
         cmd.push_str(" --state-base ");
         cmd.push_str(&shell_quote(b));
     }
-    vec!["ssh".into(), host.into(), cmd]
+    // BatchMode: fail fast instead of hanging on an auth prompt (there is no
+    // tty when spawned by an agent). ServerAlive: keep NAT'd / idle-pruning
+    // connections open across long sessions.
+    vec![
+        "ssh".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ServerAliveInterval=30".into(),
+        "-o".into(),
+        "ServerAliveCountMax=4".into(),
+        host.into(),
+        cmd,
+    ]
 }
 
 /// Request IDs must be globally unique because the server dedupes on them for
@@ -651,11 +666,13 @@ mod quote_tests {
             Some("/data/sicheng/agent state"),
         );
         assert_eq!(argv[0], "ssh");
-        assert_eq!(argv[1], "host");
+        // Keepalive/batch options come before the host.
+        assert!(argv.contains(&"BatchMode=yes".to_string()));
+        let host_pos = argv.iter().position(|a| a == "host").unwrap();
+        assert_eq!(host_pos, argv.len() - 2, "host is second to last");
         assert_eq!(
-            argv[2],
+            argv[argv.len() - 1],
             "'agent-remote-server' --root '/data/my project' --state-base '/data/sicheng/agent state'"
         );
-        assert_eq!(argv.len(), 3);
     }
 }

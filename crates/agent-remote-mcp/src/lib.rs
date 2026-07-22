@@ -118,26 +118,84 @@ pub struct RequestStatusInput {
 // ---- MCP server ----
 
 pub struct RemoteWorkspaceServer {
-    pub client: Arc<Client>,
+    /// Argv used to (re)spawn the transport to the server.
+    server_argv: Vec<String>,
+    /// Current connection. A Client never recovers once its transport dies
+    /// (e.g. sshd resetting the connection), so tool calls fetch it through
+    /// `client()`, which reconnects on demand.
+    client_slot: tokio::sync::Mutex<Option<Arc<Client>>>,
     #[allow(dead_code)]
     tool_router: ToolRouter<RemoteWorkspaceServer>,
 }
 
-#[tool_router]
+const CONNECT_ATTEMPTS: u32 = 4;
+const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl RemoteWorkspaceServer {
-    pub fn new(client: Arc<Client>) -> Self {
+    pub fn new(server_argv: Vec<String>) -> Self {
         Self {
-            client,
+            server_argv,
+            client_slot: tokio::sync::Mutex::new(None),
             tool_router: Self::tool_router(),
         }
     }
 
+    /// Returns a live client, (re)connecting with retries if there is none or
+    /// the previous connection died. A fresh connection is probed with a real
+    /// round-trip, because a transport can spawn fine and die immediately
+    /// (e.g. sshd resetting rapid successive connections).
+    async fn client(&self) -> Result<Arc<Client>, String> {
+        let mut slot = self.client_slot.lock().await;
+        if let Some(c) = slot.as_ref() {
+            if !c.is_closed() {
+                return Ok(c.clone());
+            }
+        }
+        let mut last = String::new();
+        for attempt in 1..=CONNECT_ATTEMPTS {
+            if attempt > 1 {
+                tokio::time::sleep(CONNECT_BACKOFF).await;
+            }
+            let transport = agent_remote_client::ArgvTransport {
+                argv: self.server_argv.clone(),
+            };
+            match Client::connect(transport, None).await {
+                Ok(c) => match c.stat(".").await {
+                    Ok(_) => {
+                        let c = Arc::new(c);
+                        *slot = Some(c.clone());
+                        return Ok(c);
+                    }
+                    Err(e) => last = format!("attempt {attempt}: connection probe failed: {e}"),
+                },
+                Err(e) => last = format!("attempt {attempt}: connect failed: {e}"),
+            }
+        }
+        Err(format!(
+            "cannot reach the remote workspace after {CONNECT_ATTEMPTS} attempts ({last})"
+        ))
+    }
+
+    /// Eagerly establish the first connection so startup problems (auth,
+    /// wrong paths) show up in the server log instead of only on the first
+    /// tool call. Failure is not fatal: tool calls reconnect on demand.
+    pub async fn warm_up(&self) -> Result<(), String> {
+        self.client().await.map(|_| ())
+    }
+}
+
+#[tool_router]
+impl RemoteWorkspaceServer {
     #[tool(description = "List the contents of a directory in the remote workspace.")]
     async fn list_dir(
         &self,
         Parameters(ListDirInput { path }): Parameters<ListDirInput>,
     ) -> CallToolResult {
-        match self.client.list(&path).await {
+        let client = match self.client().await {
+            Ok(c) => c,
+            Err(e) => return err(e),
+        };
+        match client.list(&path).await {
             Ok(entries) => {
                 if entries.is_empty() {
                     return ok("(empty directory)");
@@ -171,7 +229,11 @@ impl RemoteWorkspaceServer {
             limit,
         }): Parameters<ReadFileInput>,
     ) -> CallToolResult {
-        match self.client.read(&path, offset, limit).await {
+        let client = match self.client().await {
+            Ok(c) => c,
+            Err(e) => return err(e),
+        };
+        match client.read(&path, offset, limit).await {
             Ok(r) => {
                 let mut out = r.content;
                 if r.truncated {
@@ -188,7 +250,11 @@ impl RemoteWorkspaceServer {
 
     #[tool(description = "Get metadata for a file or directory: type, size, hash, permissions.")]
     async fn stat(&self, Parameters(StatInput { path }): Parameters<StatInput>) -> CallToolResult {
-        match self.client.stat(&path).await {
+        let client = match self.client().await {
+            Ok(c) => c,
+            Err(e) => return err(e),
+        };
+        match client.stat(&path).await {
             Ok(s) => ok(serde_json::to_string_pretty(&s)
                 .unwrap_or_else(|e| format!("stat ok, serialize error: {e}"))),
             Err(e) => err(format!("{e}")),
@@ -206,11 +272,11 @@ impl RemoteWorkspaceServer {
             base_hash,
         }): Parameters<WriteFileInput>,
     ) -> CallToolResult {
-        match self
-            .client
-            .write(&path, &content, base_hash.as_deref())
-            .await
-        {
+        let client = match self.client().await {
+            Ok(c) => c,
+            Err(e) => return err(e),
+        };
+        match client.write(&path, &content, base_hash.as_deref()).await {
             Ok(w) => ok(format!(
                 "Wrote {path}. operation_id={}, new_hash={}",
                 w.operation_id, w.new_hash
@@ -230,7 +296,11 @@ impl RemoteWorkspaceServer {
             patch,
         }): Parameters<PatchFileInput>,
     ) -> CallToolResult {
-        match self.client.patch(&path, &base_hash, &patch).await {
+        let client = match self.client().await {
+            Ok(c) => c,
+            Err(e) => return err(e),
+        };
+        match client.patch(&path, &base_hash, &patch).await {
             Ok(w) => ok(format!(
                 "Patched {path}. operation_id={}, new_hash={}",
                 w.operation_id, w.new_hash
@@ -244,7 +314,11 @@ impl RemoteWorkspaceServer {
         &self,
         Parameters(DeleteFileInput { path }): Parameters<DeleteFileInput>,
     ) -> CallToolResult {
-        match self.client.delete(&path).await {
+        let client = match self.client().await {
+            Ok(c) => c,
+            Err(e) => return err(e),
+        };
+        match client.delete(&path).await {
             Ok(w) => ok(format!("Deleted {path}. operation_id={}", w.operation_id)),
             Err(e) => err(format!("{e}")),
         }
@@ -262,10 +336,13 @@ impl RemoteWorkspaceServer {
             timeout_ms,
         }): Parameters<RunCommandInput>,
     ) -> CallToolResult {
+        let client = match self.client().await {
+            Ok(c) => c,
+            Err(e) => return err(e),
+        };
         let mut stdout = CappedString::new(OUTPUT_LIMIT);
         let mut stderr = CappedString::new(OUTPUT_LIMIT);
-        let result = self
-            .client
+        let result = client
             .exec(
                 argv,
                 cwd,
@@ -312,7 +389,11 @@ impl RemoteWorkspaceServer {
         &self,
         Parameters(UndoInput { operation_id }): Parameters<UndoInput>,
     ) -> CallToolResult {
-        match self.client.undo(&operation_id).await {
+        let client = match self.client().await {
+            Ok(c) => c,
+            Err(e) => return err(e),
+        };
+        match client.undo(&operation_id).await {
             Ok(u) => ok(format!(
                 "Undid target {operation_id}; undo_operation_id={}, new_hash={}",
                 u.operation_id, u.new_hash
@@ -328,7 +409,11 @@ impl RemoteWorkspaceServer {
         &self,
         Parameters(HistoryInput { limit }): Parameters<HistoryInput>,
     ) -> CallToolResult {
-        match self.client.history(limit).await {
+        let client = match self.client().await {
+            Ok(c) => c,
+            Err(e) => return err(e),
+        };
+        match client.history(limit).await {
             Ok(ops) => {
                 if ops.is_empty() {
                     return ok("(no operations recorded)");
@@ -349,7 +434,11 @@ impl RemoteWorkspaceServer {
         &self,
         Parameters(OperationGetInput { operation_id }): Parameters<OperationGetInput>,
     ) -> CallToolResult {
-        match self.client.operation_get(&operation_id).await {
+        let client = match self.client().await {
+            Ok(c) => c,
+            Err(e) => return err(e),
+        };
+        match client.operation_get(&operation_id).await {
             Ok(d) => ok(serde_json::to_string_pretty(&d)
                 .unwrap_or_else(|e| format!("serialize error: {e}"))),
             Err(e) => err(format!("{e}")),
@@ -361,7 +450,11 @@ impl RemoteWorkspaceServer {
         &self,
         Parameters(RequestStatusInput { request_id }): Parameters<RequestStatusInput>,
     ) -> CallToolResult {
-        match self.client.request_status(&request_id).await {
+        let client = match self.client().await {
+            Ok(c) => c,
+            Err(e) => return err(e),
+        };
+        match client.request_status(&request_id).await {
             Ok(r) => ok(serde_json::to_string_pretty(&r)
                 .unwrap_or_else(|e| format!("serialize error: {e}"))),
             Err(e) => err(format!("{e}")),

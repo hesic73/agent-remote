@@ -350,3 +350,53 @@ fn mcp_full_tool_surface() {
     assert!(!e, "request_status failed: {text}");
     assert!(text.contains("unknown"), "unexpected status: {text}");
 }
+
+// If the connection to the server dies mid-session, the next tool call must
+// transparently reconnect instead of failing forever with "server closed
+// connection" (regression: flaky sshd resetting the connection).
+#[test]
+fn mcp_reconnects_after_server_death() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let mut s = McpSession::spawn(root);
+    s.call(
+        "initialize",
+        serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0.1"},
+        }),
+    );
+    s.notify("notifications/initialized", serde_json::json!({}));
+
+    let list = |s: &mut McpSession| -> (bool, String) {
+        let resp = s.call(
+            "tools/call",
+            serde_json::json!({"name": "list_dir", "arguments": {"path": "."}}),
+        );
+        (
+            resp["result"]["isError"].as_bool().unwrap(),
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        )
+    };
+
+    let (e, _) = list(&mut s);
+    assert!(!e, "first call must succeed");
+
+    // Kill the underlying server process. Anchored so it matches only the
+    // server itself, not the MCP process whose argv also contains this text
+    // (via --remote-bin/--root).
+    let killed = std::process::Command::new("pkill")
+        .args(["-f", &format!("^{} --root {root}", server_bin())])
+        .status()
+        .unwrap();
+    assert!(killed.success(), "must find and kill the server process");
+    // Give the MCP's reader a moment to observe the EOF.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let (e, text) = list(&mut s);
+    assert!(!e, "call after server death must reconnect, got: {text}");
+}

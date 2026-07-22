@@ -322,7 +322,13 @@ async fn cli_over_fake_ssh_quotes_paths_with_spaces() {
 
     let stub = tempfile::tempdir().unwrap();
     let ssh_path = stub.path().join("ssh");
-    std::fs::write(&ssh_path, "#!/bin/sh\nshift\nexec sh -c \"$*\"\n").unwrap();
+    // Skip `-o opt` pairs and the host, then run the remaining args joined
+    // with spaces through a shell -- the same thing real ssh does remotely.
+    std::fs::write(
+        &ssh_path,
+        "#!/bin/sh\nwhile [ \"$1\" = \"-o\" ]; do shift 2; done\nshift\nexec sh -c \"$*\"\n",
+    )
+    .unwrap();
     std::fs::set_permissions(&ssh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
     let path_env = format!(
         "{}:{}",

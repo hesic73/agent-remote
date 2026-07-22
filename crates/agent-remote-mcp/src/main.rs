@@ -1,6 +1,3 @@
-use std::sync::Arc;
-
-use agent_remote_client::{Client, Transport};
 use agent_remote_mcp::RemoteWorkspaceServer;
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -40,33 +37,6 @@ struct Cli {
     state_base: Option<String>,
 }
 
-struct ArgvTransport {
-    argv: Vec<String>,
-}
-
-impl Transport for ArgvTransport {
-    fn spawn(
-        &mut self,
-    ) -> std::io::Result<(
-        tokio::process::Child,
-        tokio::process::ChildStdin,
-        tokio::process::ChildStdout,
-    )> {
-        use std::process::Stdio;
-        use tokio::process::Command;
-        let mut cmd = Command::new(&self.argv[0]);
-        cmd.args(&self.argv[1..])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-        let mut child = cmd.spawn()?;
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
-        Ok((child, stdin, stdout))
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -103,11 +73,12 @@ async fn main() -> Result<()> {
         )
     };
 
-    let client = Client::connect(ArgvTransport { argv: server_argv }, None)
-        .await
-        .context("failed to connect to agent-remote-server")?;
-
-    let server = RemoteWorkspaceServer::new(Arc::new(client));
+    let server = RemoteWorkspaceServer::new(server_argv);
+    // Surface connection problems (auth, wrong paths) in the log immediately,
+    // but keep serving either way: tool calls reconnect on demand.
+    if let Err(e) = server.warm_up().await {
+        tracing::warn!("initial connection failed: {e}");
+    }
     let service = server
         .serve(rmcp::transport::stdio())
         .await

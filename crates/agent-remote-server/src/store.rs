@@ -939,13 +939,24 @@ fn acquire_dir_lock(
     loop {
         let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc == 0 {
+            // Record our pid (best effort) so a conflicting starter can name
+            // the holder -- e.g. a zombie server on a half-dead ssh session.
+            let _ = f.set_len(0);
+            let _ = writeln!(&f, "{}", std::process::id());
+            let _ = f.sync_all();
             return Ok(f);
         }
         if std::time::Instant::now() >= deadline {
+            let holder = std::fs::read_to_string(&path)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(|pid| format!(" (held by pid {pid})"))
+                .unwrap_or_default();
             return Err(ProtocolError::new(
                 ErrorCode::IoError,
                 format!(
-                    "state directory {log_dir:?} is locked by another agent-remote-server; \
+                    "state directory {log_dir:?} is locked by another agent-remote-server{holder}; \
                      only one server may serve a workspace root at a time"
                 ),
             ));

@@ -194,7 +194,7 @@ crates/
 ```
 
 ```bash
-cargo test --workspace --all-targets   # 123 tests, incl. end-to-end against
+cargo test --workspace --all-targets   # 124 tests, incl. end-to-end against
                                        # the real server and MCP binaries
 cargo clippy --workspace --all-targets -- -D warnings
 ```
