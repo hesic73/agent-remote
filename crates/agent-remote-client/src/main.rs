@@ -35,6 +35,11 @@ struct Cli {
     #[arg(long)]
     log_dir: Option<String>,
 
+    /// Optional base directory for server state instead of ~/.agent-remote on
+    /// the remote (state still keyed per workspace under <base>/state/).
+    #[arg(long, conflicts_with = "log_dir")]
+    state_base: Option<String>,
+
     /// Run the server locally as a subprocess instead of over SSH. The
     /// --remote-bin must be an executable path available locally.
     #[arg(long)]
@@ -172,6 +177,10 @@ async fn async_main_real() -> Result<()> {
             argv.push("--log-dir".into());
             argv.push(d.clone());
         }
+        if let Some(b) = &cli.state_base {
+            argv.push("--state-base".into());
+            argv.push(b.clone());
+        }
         argv
     } else {
         let host = cli.host.as_ref().ok_or_else(|| {
@@ -183,6 +192,7 @@ async fn async_main_real() -> Result<()> {
             &cli.root,
             cli.config.as_deref(),
             cli.log_dir.as_deref(),
+            cli.state_base.as_deref(),
         )
     };
 

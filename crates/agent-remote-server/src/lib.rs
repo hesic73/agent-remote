@@ -11,13 +11,14 @@ pub mod workspace;
 
 pub use server::{Server, ServerOptions};
 
-/// Default state directory for a workspace root: `<home>/.agent-remote/state/
+/// State directory for a workspace root under `base`: `<base>/state/
 /// <name>-<hash12>`, where `name` is the root's final path component and
 /// `hash12` is the first 12 hex chars of sha256 over the canonical root path.
 /// Keyed by path so every workspace gets its own isolated store, outside the
-/// workspace itself.
-pub fn default_state_dir(
-    home: &std::path::Path,
+/// workspace itself. `base` defaults to `~/.agent-remote` (see main.rs) and
+/// can be redirected with `--state-base`, e.g. when home is nearly full.
+pub fn state_dir_under(
+    base: &std::path::Path,
     root: &std::path::Path,
 ) -> anyhow::Result<std::path::PathBuf> {
     let canonical = root
@@ -30,34 +31,43 @@ pub fn default_state_dir(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "root".into());
-    Ok(home
-        .join(".agent-remote")
-        .join("state")
-        .join(format!("{name}-{hash12}")))
+    Ok(base.join("state").join(format!("{name}-{hash12}")))
 }
 
 #[cfg(test)]
 mod state_dir_tests {
-    use super::default_state_dir;
+    use super::state_dir_under;
 
     #[test]
     fn keyed_by_canonical_root() {
-        let home = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let a = default_state_dir(home.path(), root.path()).unwrap();
+        let a = state_dir_under(base.path(), root.path()).unwrap();
         // A relative-ish spelling of the same root maps to the same directory.
         let dotted = root.path().join(".");
-        let b = default_state_dir(home.path(), &dotted).unwrap();
+        let b = state_dir_under(base.path(), &dotted).unwrap();
         assert_eq!(a, b);
-        assert!(a.starts_with(home.path().join(".agent-remote/state")));
+        assert!(a.starts_with(base.path().join("state")));
         let leaf = a.file_name().unwrap().to_string_lossy().into_owned();
         let root_name = root.path().file_name().unwrap().to_string_lossy();
         assert!(leaf.starts_with(&format!("{root_name}-")));
     }
 
     #[test]
+    fn different_bases_give_disjoint_dirs_same_key() {
+        let base1 = tempfile::tempdir().unwrap();
+        let base2 = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let a = state_dir_under(base1.path(), root.path()).unwrap();
+        let b = state_dir_under(base2.path(), root.path()).unwrap();
+        assert_ne!(a, b);
+        // Same per-root key under both bases.
+        assert_eq!(a.file_name(), b.file_name());
+    }
+
+    #[test]
     fn missing_root_is_an_error() {
-        let home = tempfile::tempdir().unwrap();
-        assert!(default_state_dir(home.path(), std::path::Path::new("/nonexistent-xyz")).is_err());
+        let base = tempfile::tempdir().unwrap();
+        assert!(state_dir_under(base.path(), std::path::Path::new("/nonexistent-xyz")).is_err());
     }
 }

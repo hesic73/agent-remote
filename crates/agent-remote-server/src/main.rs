@@ -21,6 +21,12 @@ struct Args {
     #[arg(long)]
     log_dir: Option<PathBuf>,
 
+    /// Base directory for state instead of `~/.agent-remote` (state still goes
+    /// to `<base>/state/<name>-<hash>` per workspace). Useful when home is
+    /// nearly full. Mutually exclusive with --log-dir.
+    #[arg(long, conflicts_with = "log_dir")]
+    state_base: Option<PathBuf>,
+
     /// Path to a TOML config file with profile setup scripts.
     #[arg(long)]
     config: Option<PathBuf>,
@@ -43,9 +49,16 @@ async fn main() -> anyhow::Result<()> {
     let log_dir = match args.log_dir {
         Some(d) => d,
         None => {
-            let home = std::env::var_os("HOME")
-                .ok_or_else(|| anyhow::anyhow!("HOME is not set; pass --log-dir explicitly"))?;
-            agent_remote_server::default_state_dir(std::path::Path::new(&home), &args.root)?
+            let base = match args.state_base {
+                Some(b) => b,
+                None => {
+                    let home = std::env::var_os("HOME").ok_or_else(|| {
+                        anyhow::anyhow!("HOME is not set; pass --state-base or --log-dir")
+                    })?;
+                    PathBuf::from(home).join(".agent-remote")
+                }
+            };
+            agent_remote_server::state_dir_under(&base, &args.root)?
         }
     };
 

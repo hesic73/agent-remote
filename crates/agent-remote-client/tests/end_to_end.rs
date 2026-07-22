@@ -381,3 +381,64 @@ async fn cli_over_fake_ssh_quotes_paths_with_spaces() {
     assert!(state.join("operations.jsonl").exists());
     assert!(!root.join(".agent-remote").exists());
 }
+
+// --state-base redirects the state base while keeping per-root keying, and
+// conflicts with --log-dir.
+#[tokio::test]
+async fn cli_state_base_redirects_state_location() {
+    let base = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let state_base = base.path().join("alt-state");
+    let cli = env!("CARGO_BIN_EXE_agent-remote");
+    let srv = server_bin();
+
+    let out = std::process::Command::new(cli)
+        .args([
+            "--local",
+            "--remote-bin",
+            &srv.to_string_lossy(),
+            "--root",
+            &root.path().to_string_lossy(),
+            "--state-base",
+            &state_base.to_string_lossy(),
+            "exec",
+            "--",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "exec failed: {out:?}");
+
+    // State landed under <base>/state/<name>-<hash>, workspace untouched.
+    let state_root = state_base.join("state");
+    let entries: Vec<_> = std::fs::read_dir(&state_root).unwrap().collect();
+    assert_eq!(entries.len(), 1, "exactly one per-root state dir");
+    let keyed = entries[0].as_ref().unwrap().path();
+    let root_name = root.path().file_name().unwrap().to_string_lossy();
+    assert!(keyed
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with(&*root_name));
+    assert!(keyed.join("operations.jsonl").exists());
+    assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
+
+    // Passing both --state-base and --log-dir is a hard error.
+    let out = std::process::Command::new(cli)
+        .args([
+            "--local",
+            "--remote-bin",
+            &srv.to_string_lossy(),
+            "--root",
+            &root.path().to_string_lossy(),
+            "--state-base",
+            "/tmp/a",
+            "--log-dir",
+            "/tmp/b",
+            "ls",
+            ".",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "conflicting flags must be rejected");
+}

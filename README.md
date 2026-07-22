@@ -91,7 +91,7 @@ source /opt/ros/humble/setup.bash
 
 Shared flags: `--host`, `--remote-bin` (default `agent-remote-server`),
 `--root`, `--config`, `--local`, `--log <file>` (client interaction log),
-`--log-dir` (override the server state directory).
+`--state-base` / `--log-dir` (relocate server state, see below).
 
 ## Server state
 
@@ -105,7 +105,11 @@ workspace**, on the remote host:
 
 The workspace itself is never touched (no dotdir, nothing for `git status`),
 and a destructive command inside the workspace cannot take the undo data with
-it. Pass `--log-dir` to relocate the state explicitly.
+it. Two ways to relocate state (mutually exclusive):
+
+- `--state-base /data/$USER` -- different base, same automatic per-workspace
+  keying (`<base>/state/<name>-<hash>`). Use when home is nearly full.
+- `--log-dir <dir>` -- exact directory, no keying. Full manual control.
 
 Growth is bounded: at startup the server keeps only the newest
 `--history-limit` operations (default 1000; 0 disables) and drops older
