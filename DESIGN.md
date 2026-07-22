@@ -191,6 +191,12 @@ MCP-capable agent gets the workspace as tools: `list_dir`, `stat`,
   response unbounded.
 * In SSH mode the remote command line is shell-quoted per argument, because
   `ssh` re-parses its trailing arguments through the remote shell.
+* Connections are rebuilt on demand: a dead link is replaced on the next
+  tool call (retries with backoff, probed with a real round-trip), while a
+  call that dies mid-flight surfaces as an error and is never auto-retried.
+  `initialize` never blocks on connecting, and the transport child carries
+  PDEATHSIG so a killed MCP cannot orphan its ssh (which would keep the
+  remote server -- and the state lock -- alive).
 
 ## Technology
 

@@ -46,19 +46,13 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // In local mode each arg is a separate argv element (no shell). In SSH
-    // mode ssh_server_argv shell-quotes everything into one remote command.
     let server_argv: Vec<String> = if cli.local {
-        let mut argv = vec![cli.remote_bin.clone(), "--root".into(), cli.root.clone()];
-        if let Some(cfg) = &cli.config {
-            argv.push("--config".into());
-            argv.push(cfg.clone());
-        }
-        if let Some(b) = &cli.state_base {
-            argv.push("--state-base".into());
-            argv.push(b.clone());
-        }
-        argv
+        agent_remote_client::local_server_argv(
+            &cli.remote_bin,
+            &cli.root,
+            cli.config.as_deref(),
+            cli.state_base.as_deref(),
+        )
     } else {
         let host = cli
             .host

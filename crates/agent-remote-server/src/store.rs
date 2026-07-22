@@ -23,7 +23,6 @@ pub enum StoredResult {
 pub struct RequestEntry {
     pub status: RequestStatus,
     pub result: Option<StoredResult>,
-    #[allow(dead_code)]
     pub op: Option<String>,
 }
 
@@ -214,11 +213,6 @@ impl OperationStore {
             write_lock: Arc::new(AsyncMutex::new(())),
             _dir_lock: Arc::new(dir_lock),
         })
-    }
-
-    #[allow(dead_code)]
-    pub fn log_dir(&self) -> &std::path::Path {
-        &self.log_dir
     }
 
     pub async fn write_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {

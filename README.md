@@ -157,6 +157,13 @@ Tool failures come back as MCP `isError` results. `run_command` output is
 capped at 16 MiB per stream (UTF-8-safe truncation, dropped bytes reported),
 so chatty commands cannot blow up the agent's context.
 
+The connection is resilient: if the SSH link dies (network blip, sshd
+resetting the connection), the next tool call reconnects automatically with
+retries and a liveness probe. A call that fails mid-flight is reported as an
+error, never silently re-executed. The spawned `ssh` uses BatchMode (no tty
+prompts) and keepalives, and dies with the MCP process, so a killed session
+cannot leave an orphaned connection holding the remote state lock.
+
 ## Guarantees
 
 - **Workspace boundary.** Paths resolve inside `--root`; `..`, absolute

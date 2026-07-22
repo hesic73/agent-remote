@@ -3,7 +3,7 @@ use std::sync::Arc;
 use agent_remote_client::Client;
 use agent_remote_protocol::{ExecEventKind, ListKind};
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::wrapper::Parameters,
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router, ServerHandler,
 };
@@ -124,8 +124,6 @@ pub struct RemoteWorkspaceServer {
     /// (e.g. sshd resetting the connection), so tool calls fetch it through
     /// `client()`, which reconnects on demand.
     client_slot: tokio::sync::Mutex<Option<Arc<Client>>>,
-    #[allow(dead_code)]
-    tool_router: ToolRouter<RemoteWorkspaceServer>,
 }
 
 const CONNECT_ATTEMPTS: u32 = 4;
@@ -136,7 +134,6 @@ impl RemoteWorkspaceServer {
         Self {
             server_argv,
             client_slot: tokio::sync::Mutex::new(None),
-            tool_router: Self::tool_router(),
         }
     }
 

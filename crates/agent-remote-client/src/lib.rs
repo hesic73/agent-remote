@@ -602,6 +602,26 @@ pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Argv for spawning the server as a local subprocess: plain argv elements,
+/// no shell involved.
+pub fn local_server_argv(
+    server_bin: &str,
+    root: &str,
+    config: Option<&str>,
+    state_base: Option<&str>,
+) -> Vec<String> {
+    let mut argv = vec![server_bin.into(), "--root".into(), root.into()];
+    if let Some(c) = config {
+        argv.push("--config".into());
+        argv.push(c.into());
+    }
+    if let Some(b) = state_base {
+        argv.push("--state-base".into());
+        argv.push(b.into());
+    }
+    argv
+}
+
 /// Build the argv for spawning the server over ssh. `ssh` joins its trailing
 /// arguments with spaces and hands the result to the remote shell, so every
 /// remote-side argument is quoted into one command string.
