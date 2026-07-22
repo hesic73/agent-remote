@@ -154,8 +154,21 @@ claude mcp add local-ws -- \
 ```
 
 Tools: `list_dir`, `stat`, `read_file`, `write_file`, `patch_file`,
-`delete_file`, `run_command`, `undo`, `history`, `operation_get`,
-`request_status`. Flags mirror the CLI.
+`delete_file`, `run_command`, `upload_file`, `download_file`, `undo`,
+`history`, `operation_get`, `request_status`. Flags mirror the CLI.
+
+`upload_file` / `download_file` move single regular files between the local
+machine and the remote workspace (or `@scratch/...`). They are synchronous and
+stream raw bytes over a dedicated SSH process with a fixed-size buffer -- file
+content never passes through the JSONL protocol or the model context, and
+memory use does not grow with file size. Both ends compute SHA-256 and the
+transfer only commits (atomically, on the remote via rename/link, locally via
+temp-file rename) when size and hash match. Existing destinations are refused
+unless `overwrite=true`; parent directories are never created implicitly. The
+result and the operation log carry metadata only: direction, remote path,
+size, `sha256:...`, duration. Transfers cannot be undone, and there is no
+resume -- a failed or disconnected transfer leaves the destination absent (or
+untouched), and you simply call the tool again.
 
 Tool failures come back as MCP `isError` results. `run_command` is synchronous
 and returns a server-bounded preview for each stream: the first 4 KiB and last

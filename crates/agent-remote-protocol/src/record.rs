@@ -22,6 +22,27 @@ pub struct FsOperationRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferDirection {
+    Upload,
+    Download,
+}
+
+/// Metadata-only record of a completed file transfer. Never stores local
+/// paths, staging paths, or file content; `path` is the remote logical path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferOperationRecord {
+    pub operation_id: String,
+    pub request_id: String,
+    pub direction: TransferDirection,
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
+    pub duration_ms: u64,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecDisposition {
     /// The command ran to a normal exit or signal termination.
@@ -86,6 +107,7 @@ pub struct PreparedRecord {
 pub enum AnyOperationRecord {
     Fs(FsOperationRecord),
     Exec(ExecOperationRecord),
+    Transfer(TransferOperationRecord),
     Prepared(PreparedRecord),
     /// Marks a prepared record as definitively rolled back. Written durably so
     /// a future restart does not resurrect the orphaned prepared marker.
@@ -107,6 +129,7 @@ impl AnyOperationRecord {
         match self {
             AnyOperationRecord::Fs(r) => &r.operation_id,
             AnyOperationRecord::Exec(r) => &r.operation_id,
+            AnyOperationRecord::Transfer(r) => &r.operation_id,
             AnyOperationRecord::Prepared(r) => &r.operation_id,
             AnyOperationRecord::Aborted(r) => &r.operation_id,
         }
@@ -116,6 +139,7 @@ impl AnyOperationRecord {
         match self {
             AnyOperationRecord::Fs(r) => r.timestamp_ms,
             AnyOperationRecord::Exec(r) => r.timestamp_ms,
+            AnyOperationRecord::Transfer(r) => r.timestamp_ms,
             AnyOperationRecord::Prepared(r) => r.timestamp_ms,
             AnyOperationRecord::Aborted(r) => r.timestamp_ms,
         }
@@ -125,7 +149,9 @@ impl AnyOperationRecord {
     pub fn is_committed(&self) -> bool {
         matches!(
             self,
-            AnyOperationRecord::Fs(_) | AnyOperationRecord::Exec(_)
+            AnyOperationRecord::Fs(_)
+                | AnyOperationRecord::Exec(_)
+                | AnyOperationRecord::Transfer(_)
         )
     }
 }

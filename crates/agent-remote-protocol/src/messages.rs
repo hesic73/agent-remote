@@ -58,6 +58,33 @@ pub enum RequestBody {
     Undo {
         operation_id: OperationId,
     },
+    /// Reserve an upload target and create a staging file next to it. The
+    /// returned staging path is client-internal plumbing for the raw receiver;
+    /// it must never surface in MCP tool results, history, or logs.
+    UploadPrepare {
+        path: String,
+        overwrite: bool,
+    },
+    /// Atomically install a fully-staged upload. `size`/`sha256`/`duration_ms`
+    /// are the client-verified transfer metadata to record.
+    UploadCommit {
+        transfer_id: String,
+        size: u64,
+        sha256: String,
+        duration_ms: u64,
+    },
+    /// Drop a pending upload and delete its staging file.
+    UploadAbort {
+        transfer_id: String,
+    },
+    /// Record a completed download (data flowed through the raw sender; this
+    /// only appends the metadata-only operation record).
+    DownloadRecord {
+        path: String,
+        size: u64,
+        sha256: String,
+        duration_ms: u64,
+    },
     History {
         #[serde(default)]
         limit: Option<usize>,
@@ -109,6 +136,12 @@ pub enum ResultBody {
     Exec(ExecResult),
     #[serde(rename = "undo")]
     Undo(UndoResult),
+    #[serde(rename = "upload_prepare")]
+    UploadPrepare(UploadPrepareResult),
+    #[serde(rename = "upload_abort")]
+    UploadAbort { transfer_id: String },
+    #[serde(rename = "transfer")]
+    Transfer(TransferResult),
     #[serde(rename = "history")]
     History {
         operations: Vec<crate::record::AnyOperationRecord>,
@@ -202,6 +235,24 @@ pub struct ExecOutput {
     pub suffix: String,
     pub total_bytes: u64,
     pub omitted_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadPrepareResult {
+    pub transfer_id: String,
+    /// Absolute staging path on the remote host, for the raw receiver only.
+    /// Client-internal: never shown to the agent or persisted anywhere.
+    pub staging_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferResult {
+    pub operation_id: OperationId,
+    pub direction: crate::record::TransferDirection,
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
+    pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use agent_remote_client::Client;
+use agent_remote_client::{Client, Endpoint};
 use agent_remote_protocol::ListKind;
 use rmcp::{
     handler::server::wrapper::Parameters,
@@ -129,11 +129,36 @@ pub struct RequestStatusInput {
     pub request_id: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UploadFileInput {
+    #[schemars(description = "Absolute or relative path of the local source file")]
+    pub local_path: String,
+    #[schemars(
+        description = "Destination path relative to workspace, or @scratch/... for server-managed scratch"
+    )]
+    pub remote_path: String,
+    #[schemars(description = "Replace an existing destination file (default: false)")]
+    pub overwrite: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DownloadFileInput {
+    #[schemars(
+        description = "Source path relative to workspace, or @scratch/... for server-managed scratch"
+    )]
+    pub remote_path: String,
+    #[schemars(description = "Absolute or relative path of the local destination file")]
+    pub local_path: String,
+    #[schemars(description = "Replace an existing destination file (default: false)")]
+    pub overwrite: Option<bool>,
+}
+
 // ---- MCP server ----
 
 pub struct RemoteWorkspaceServer {
-    /// Argv used to (re)spawn the transport to the server.
-    server_argv: Vec<String>,
+    /// Where the server runs; source of the control-plane argv used to
+    /// (re)spawn the transport and of the raw transfer argvs.
+    endpoint: Endpoint,
     /// Current connection. A Client never recovers once its transport dies
     /// (e.g. sshd resetting the connection), so tool calls fetch it through
     /// `client()`, which reconnects on demand.
@@ -144,9 +169,9 @@ const CONNECT_ATTEMPTS: u32 = 4;
 const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl RemoteWorkspaceServer {
-    pub fn new(server_argv: Vec<String>) -> Self {
+    pub fn new(endpoint: Endpoint) -> Self {
         Self {
-            server_argv,
+            endpoint,
             client_slot: tokio::sync::Mutex::new(None),
         }
     }
@@ -168,7 +193,7 @@ impl RemoteWorkspaceServer {
                 tokio::time::sleep(CONNECT_BACKOFF).await;
             }
             let transport = agent_remote_client::ArgvTransport {
-                argv: self.server_argv.clone(),
+                argv: self.endpoint.control_argv(),
             };
             match Client::connect(transport, None).await {
                 Ok(c) => match c.stat(".").await {
@@ -360,6 +385,73 @@ impl RemoteWorkspaceServer {
                 Ok(text) => ok(text),
                 Err(e) => err(format!("could not serialize command result: {e}")),
             },
+            Err(e) => err(format!("{e}")),
+        }
+    }
+
+    #[tool(
+        description = "Upload one local regular file to the remote workspace as raw streamed bytes; the file content never enters the model context, so use this (not write_file or shell tricks) for binary or large files. remote_path is workspace-relative or @scratch/...; its parent directory must already exist. Synchronous: the call returns only when the file is fully installed remotely, so a long-running call is normal for big files. Existing destinations are never replaced unless overwrite=true."
+    )]
+    async fn upload_file(
+        &self,
+        Parameters(UploadFileInput {
+            local_path,
+            remote_path,
+            overwrite,
+        }): Parameters<UploadFileInput>,
+    ) -> CallToolResult {
+        let client = match self.client().await {
+            Ok(c) => c,
+            Err(e) => return err(e),
+        };
+        match agent_remote_client::upload_file(
+            &client,
+            &self.endpoint,
+            std::path::Path::new(&local_path),
+            &remote_path,
+            overwrite.unwrap_or(false),
+            None,
+        )
+        .await
+        {
+            Ok(r) => ok(serde_json::to_string_pretty(&r)
+                .unwrap_or_else(|e| format!("upload ok, serialize error: {e}"))),
+            Err(e) => err(format!("{e}")),
+        }
+    }
+
+    #[tool(
+        description = "Download one remote regular file to the local machine as raw streamed bytes; the file content never enters the model context, so use this (not read_file) for binary or large files. remote_path is workspace-relative or @scratch/...; the local parent directory must already exist. Synchronous: the call returns only when the file is fully installed locally, so a long-running call is normal for big files. Existing destinations are never replaced unless overwrite=true."
+    )]
+    async fn download_file(
+        &self,
+        Parameters(DownloadFileInput {
+            remote_path,
+            local_path,
+            overwrite,
+        }): Parameters<DownloadFileInput>,
+    ) -> CallToolResult {
+        let client = match self.client().await {
+            Ok(c) => c,
+            Err(e) => return err(e),
+        };
+        match agent_remote_client::download_file(
+            &client,
+            &self.endpoint,
+            &remote_path,
+            std::path::Path::new(&local_path),
+            overwrite.unwrap_or(false),
+            None,
+        )
+        .await
+        {
+            Ok(mut r) => {
+                // For a download the useful path is the local destination; the
+                // server-side record keeps the remote logical path.
+                r.path = local_path;
+                ok(serde_json::to_string_pretty(&r)
+                    .unwrap_or_else(|e| format!("download ok, serialize error: {e}")))
+            }
             Err(e) => err(format!("{e}")),
         }
     }

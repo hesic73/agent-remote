@@ -75,6 +75,7 @@ Interactive sessions (PTY, REPL, persistent shell) are out of scope.
 ```text
 list  stat  read  write  patch  delete  exec
 undo  history  operation.get  request.status  gc
+upload_prepare  upload_commit  upload_abort  download_record   (transfer control plane)
 ```
 
 ### Reads and hashes
@@ -109,6 +110,41 @@ rejected as a whole.
 The result is synchronous and bounded: each stream retains its first 4 KiB and
 last 12 KiB. `exec` promises no transactionality and no undo -- it can do
 anything the remote user can.
+
+### File transfer
+
+`upload_file`/`download_file` (exposed as MCP tools and client-library
+functions) move single regular files without pushing content through the JSONL
+protocol. The control plane stays on the resident connection; the data plane is
+a separate short-lived process per transfer, spawned over the same SSH
+configuration:
+
+```text
+agent-remote-server --transfer-receive <staging> --expect-size N   # stdin -> staging file
+agent-remote-server --transfer-send <path> --root R [--state-base B]  # header JSON, raw bytes, trailer JSON -> stdout
+```
+
+These raw modes never open the operation store, so they cannot conflict with
+the resident server's state lock. `--transfer-send` re-validates the path with
+the same workspace/`@scratch` boundary rules as every other operation.
+
+Uploads are three-phase on the control plane: `upload_prepare` validates the
+target (parent must exist; existing targets refused unless `overwrite`) and
+creates a random `.part` staging file in the target's directory;
+`upload_commit` verifies the staged size, installs atomically (rename for
+overwrite, hard-link-then-unlink for race-free no-replace), fsyncs, and appends
+the operation record; `upload_abort` deletes the staging file after a failure.
+The staging path travels only between the resident server and the client; it is
+never persisted or shown to the agent. Downloads verify size and SHA-256
+against the sender's framing, install locally via temp file + (no-clobber)
+rename, then append a `download_record`.
+
+Both directions stream through fixed 64 KiB buffers with SHA-256 computed on
+each side; memory does not grow with file size. Operation records are
+metadata-only (direction, remote logical path, size, hash, duration) -- no
+local paths, no content. Transfers are synchronous, cannot be undone, and have
+no resume/job machinery: a dropped connection fails the call, the destination
+is never left half-written, and the caller just retries.
 
 ## Undo
 
@@ -187,7 +223,8 @@ than duplicating those instructions.
 `agent-remote-mcp` wraps the client library in an MCP stdio server, so any
 MCP-capable agent gets the workspace as tools: `list_dir`, `stat`,
 `read_file`, `write_file`, `patch_file`, `delete_file`, `run_command`,
-`undo`, `history`, `operation_get`, `request_status`.
+`upload_file`, `download_file`, `undo`, `history`, `operation_get`,
+`request_status`.
 
 * Protocol errors map to MCP `isError` results, so failures are visible to
   the agent.

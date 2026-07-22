@@ -46,32 +46,31 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let server_argv: Vec<String> = if cli.local {
-        agent_remote_client::local_server_argv(
-            &cli.remote_bin,
-            &cli.root,
-            cli.config.as_deref(),
-            cli.state_base.as_deref(),
-        )
+    let endpoint = if cli.local {
+        agent_remote_client::Endpoint::Local {
+            server_bin: cli.remote_bin,
+            root: cli.root,
+            state_base: cli.state_base,
+            config: cli.config,
+        }
     } else {
         let host = cli
             .host
-            .as_ref()
             .ok_or_else(|| anyhow!("--host is required (or use --local)"))?;
-        agent_remote_client::ssh_server_argv(
+        agent_remote_client::Endpoint::Ssh {
             host,
-            &cli.remote_bin,
-            &cli.root,
-            cli.config.as_deref(),
-            cli.state_base.as_deref(),
-        )
+            remote_bin: cli.remote_bin,
+            root: cli.root,
+            state_base: cli.state_base,
+            config: cli.config,
+        }
     };
 
     // No eager connect: initialize must answer immediately (a blocking retry
     // loop here makes the MCP host time the server out, e.g. when a session
     // being resumed briefly overlaps its predecessor on the same state lock).
     // The first tool call connects on demand.
-    let server = RemoteWorkspaceServer::new(server_argv);
+    let server = RemoteWorkspaceServer::new(endpoint);
     let service = server
         .serve(rmcp::transport::stdio())
         .await

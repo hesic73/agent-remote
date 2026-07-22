@@ -142,27 +142,29 @@ async fn async_main_real() -> Result<()> {
         None => None,
     };
 
-    let server_argv: Vec<String> = if cli.local {
-        agent_remote_client::local_server_argv(
-            &cli.remote_bin,
-            &cli.root,
-            cli.config.as_deref(),
-            cli.state_base.as_deref(),
-        )
+    let endpoint = if cli.local {
+        agent_remote_client::Endpoint::Local {
+            server_bin: cli.remote_bin.clone(),
+            root: cli.root.clone(),
+            state_base: cli.state_base.clone(),
+            config: cli.config.clone(),
+        }
     } else {
-        let host = cli.host.as_ref().ok_or_else(|| {
+        let host = cli.host.clone().ok_or_else(|| {
             anyhow!("--host is required (or use --local to run the server locally)")
         })?;
-        agent_remote_client::ssh_server_argv(
+        agent_remote_client::Endpoint::Ssh {
             host,
-            &cli.remote_bin,
-            &cli.root,
-            cli.config.as_deref(),
-            cli.state_base.as_deref(),
-        )
+            remote_bin: cli.remote_bin.clone(),
+            root: cli.root.clone(),
+            state_base: cli.state_base.clone(),
+            config: cli.config.clone(),
+        }
     };
 
-    let transport = ArgvTransport { argv: server_argv };
+    let transport = ArgvTransport {
+        argv: endpoint.control_argv(),
+    };
     let client = Client::connect(transport, log)
         .await
         .context("connect to server")?;

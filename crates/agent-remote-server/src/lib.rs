@@ -6,6 +6,7 @@ pub mod hash;
 pub mod patch;
 pub mod server;
 pub mod store;
+pub mod transfer;
 pub mod undo;
 pub mod workspace;
 

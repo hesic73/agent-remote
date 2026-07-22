@@ -290,3 +290,112 @@ fn every_result_variant_round_trips_through_server_message() {
         assert_eq!(s, serde_json::to_string(&back).unwrap());
     }
 }
+
+#[test]
+fn transfer_requests_round_trip() {
+    let req = Request {
+        request_id: "r10".into(),
+        body: RequestBody::UploadPrepare {
+            path: "@scratch/model.pt".into(),
+            overwrite: false,
+        },
+    };
+    let line = serde_json::to_string(&req).unwrap();
+    assert_eq!(
+        line,
+        r#"{"request_id":"r10","op":"upload_prepare","path":"@scratch/model.pt","overwrite":false}"#
+    );
+    round_trip(&req);
+
+    let req = Request {
+        request_id: "r11".into(),
+        body: RequestBody::UploadCommit {
+            transfer_id: "xfer-1".into(),
+            size: 42,
+            sha256: "sha256:abc".into(),
+            duration_ms: 7,
+        },
+    };
+    round_trip(&req);
+
+    let req = Request {
+        request_id: "r12".into(),
+        body: RequestBody::UploadAbort {
+            transfer_id: "xfer-1".into(),
+        },
+    };
+    round_trip(&req);
+
+    let req = Request {
+        request_id: "r13".into(),
+        body: RequestBody::DownloadRecord {
+            path: "logs/out.bin".into(),
+            size: 42,
+            sha256: "sha256:abc".into(),
+            duration_ms: 7,
+        },
+    };
+    round_trip(&req);
+}
+
+#[test]
+fn transfer_results_round_trip_through_server_message() {
+    let cases: Vec<ResultBody> = vec![
+        ResultBody::UploadPrepare(UploadPrepareResult {
+            transfer_id: "xfer-1".into(),
+            staging_path: "/ws/.f.part".into(),
+        }),
+        ResultBody::UploadAbort {
+            transfer_id: "xfer-1".into(),
+        },
+        ResultBody::Transfer(TransferResult {
+            operation_id: "op-9".into(),
+            direction: TransferDirection::Upload,
+            path: "@scratch/model.pt".into(),
+            size: 42,
+            sha256: "sha256:abc".into(),
+            duration_ms: 7,
+        }),
+    ];
+    for body in cases {
+        let msg = ServerMessage::Result {
+            request_id: "envelope".into(),
+            result: body,
+        };
+        let s = serde_json::to_string(&msg).expect("must serialize without collision");
+        let back: ServerMessage = serde_json::from_str(&s).expect("must deserialize round-trip");
+        assert_eq!(s, serde_json::to_string(&back).unwrap());
+    }
+    let v: serde_json::Value = serde_json::to_value(ResultBody::Transfer(TransferResult {
+        operation_id: "op-9".into(),
+        direction: TransferDirection::Download,
+        path: "p".into(),
+        size: 1,
+        sha256: "sha256:x".into(),
+        duration_ms: 2,
+    }))
+    .unwrap();
+    assert_eq!(v["type"], "transfer");
+    assert_eq!(v["direction"], "download");
+}
+
+#[test]
+fn transfer_record_round_trips_as_any_operation_record() {
+    let record = AnyOperationRecord::Transfer(TransferOperationRecord {
+        operation_id: "op-5".into(),
+        request_id: "r".into(),
+        direction: TransferDirection::Upload,
+        path: "data/x.bin".into(),
+        size: 10,
+        sha256: "sha256:y".into(),
+        duration_ms: 3,
+        timestamp_ms: 4,
+    });
+    assert!(record.is_committed());
+    assert_eq!(record.operation_id(), "op-5");
+    let s = serde_json::to_string(&record).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+    assert_eq!(v["record_kind"], "transfer");
+    let back: AnyOperationRecord = serde_json::from_str(&s).unwrap();
+    assert_eq!(s, serde_json::to_string(&back).unwrap());
+}

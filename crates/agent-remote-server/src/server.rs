@@ -10,6 +10,7 @@ use crate::config::ServerConfig;
 use crate::exec;
 use crate::fs_ops;
 use crate::store::{OperationStore, StoredResult};
+use crate::transfer;
 use crate::undo;
 use crate::workspace::Workspace;
 
@@ -21,6 +22,10 @@ pub struct Server {
     pub store: OperationStore,
     pub config: Arc<ServerConfig>,
     history_limit: Option<usize>,
+    /// Pending uploads (staging file created, commit not yet received).
+    /// In-memory only: staging paths must never be persisted, and the staging
+    /// files die with the connection anyway.
+    uploads: transfer::UploadRegistry,
 }
 
 impl std::fmt::Debug for Server {
@@ -82,6 +87,7 @@ impl Server {
             store,
             config,
             history_limit: opts.history_limit,
+            uploads: transfer::UploadRegistry::default(),
         })
     }
 
@@ -140,6 +146,46 @@ impl Server {
         stdout: Arc<tokio::sync::Mutex<W>>,
     ) {
         let request_id = req.request_id.clone();
+
+        // upload_prepare/upload_abort bypass the idempotency store entirely:
+        // their results carry the staging path, which must never be persisted
+        // (requests.jsonl included), and the in-memory upload registry dies
+        // with this process, so replaying either after a reconnect could not
+        // succeed anyway.
+        match &req.body {
+            RequestBody::UploadPrepare { path, overwrite } => {
+                let result =
+                    transfer::upload_prepare(&self.workspace, &self.uploads, path, *overwrite);
+                let msg = match result {
+                    Ok(body) => ServerMessage::Result {
+                        request_id,
+                        result: body,
+                    },
+                    Err(e) => ServerMessage::Error {
+                        request_id,
+                        error: e,
+                    },
+                };
+                write_line(&stdout, &msg).await;
+                return;
+            }
+            RequestBody::UploadAbort { transfer_id } => {
+                let result = transfer::upload_abort(&self.uploads, transfer_id);
+                let msg = match result {
+                    Ok(body) => ServerMessage::Result {
+                        request_id,
+                        result: body,
+                    },
+                    Err(e) => ServerMessage::Error {
+                        request_id,
+                        error: e,
+                    },
+                };
+                write_line(&stdout, &msg).await;
+                return;
+            }
+            _ => {}
+        }
 
         // Idempotency via atomic claim: if we have seen this request_id, replay
         // its stored result without re-executing. Otherwise this call wins
@@ -291,6 +337,55 @@ impl Server {
                     .with_stdout(&stdout)
                     .await;
             }
+            RequestBody::UploadPrepare { .. } | RequestBody::UploadAbort { .. } => {
+                unreachable!("handled before the idempotency claim")
+            }
+            RequestBody::UploadCommit {
+                transfer_id,
+                size,
+                sha256,
+                duration_ms,
+            } => {
+                let guard = self.store.write_guard().await;
+                let result = transfer::upload_commit(
+                    &self.store,
+                    &guard,
+                    &request_id,
+                    &self.uploads,
+                    &transfer_id,
+                    size,
+                    &sha256,
+                    duration_ms,
+                );
+                drop(guard);
+                self.finish(&request_id, result)
+                    .await
+                    .with_stdout(&stdout)
+                    .await;
+            }
+            RequestBody::DownloadRecord {
+                path,
+                size,
+                sha256,
+                duration_ms,
+            } => {
+                let guard = self.store.write_guard().await;
+                let result = transfer::download_record(
+                    &self.workspace,
+                    &self.store,
+                    &guard,
+                    &request_id,
+                    &path,
+                    size,
+                    &sha256,
+                    duration_ms,
+                );
+                drop(guard);
+                self.finish(&request_id, result)
+                    .await
+                    .with_stdout(&stdout)
+                    .await;
+            }
             RequestBody::Undo { operation_id } => {
                 let guard = self.store.write_guard().await;
                 let result = match self.store.find_record(&operation_id) {
@@ -301,6 +396,12 @@ impl Server {
                         Err(agent_remote_protocol::ProtocolError::new(
                             ErrorCode::InvalidRequest,
                             "cannot undo an exec operation",
+                        ))
+                    }
+                    Some(agent_remote_protocol::AnyOperationRecord::Transfer(_)) => {
+                        Err(agent_remote_protocol::ProtocolError::new(
+                            ErrorCode::InvalidRequest,
+                            "transfer operations do not support undo",
                         ))
                     }
                     // A Prepared/Aborted marker should have been reconciled at
@@ -341,7 +442,8 @@ impl Server {
                 match self.store.find_record(&operation_id) {
                     Some(
                         record @ (agent_remote_protocol::AnyOperationRecord::Fs(_)
-                        | agent_remote_protocol::AnyOperationRecord::Exec(_)),
+                        | agent_remote_protocol::AnyOperationRecord::Exec(_)
+                        | agent_remote_protocol::AnyOperationRecord::Transfer(_)),
                     ) => {
                         self.finish(
                             &request_id,
@@ -628,6 +730,10 @@ fn op_kind_str(body: &RequestBody) -> &str {
         RequestBody::Exec { .. } => "exec",
         RequestBody::Delete { .. } => "delete",
         RequestBody::Undo { .. } => "undo",
+        RequestBody::UploadPrepare { .. } => "upload_prepare",
+        RequestBody::UploadCommit { .. } => "upload_commit",
+        RequestBody::UploadAbort { .. } => "upload_abort",
+        RequestBody::DownloadRecord { .. } => "download_record",
         RequestBody::History { .. } => "history",
         RequestBody::OperationGet { .. } => "operation_get",
         RequestBody::RequestStatus { .. } => "request_status",

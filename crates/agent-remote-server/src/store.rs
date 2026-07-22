@@ -614,6 +614,17 @@ impl OperationStore {
         Ok(())
     }
 
+    pub fn append_transfer_record(
+        &self,
+        record: agent_remote_protocol::TransferOperationRecord,
+    ) -> Result<(), ProtocolError> {
+        self.append_any_record(AnyOperationRecord::Transfer(record.clone()))?;
+        self.records
+            .lock()
+            .push(AnyOperationRecord::Transfer(record));
+        Ok(())
+    }
+
     pub fn load_before_blob(&self, operation_id: &str) -> Option<Vec<u8>> {
         std::fs::read(self.blobs_dir.join(format!("{operation_id}.before"))).ok()
     }
@@ -641,6 +652,7 @@ impl OperationStore {
                 match r {
                     AnyOperationRecord::Fs(f) => f.request_id == request_id,
                     AnyOperationRecord::Exec(e) => e.request_id == request_id,
+                    AnyOperationRecord::Transfer(t) => t.request_id == request_id,
                     _ => false,
                 }
             })
@@ -732,6 +744,19 @@ impl OperationStore {
                     },
                 }
             }
+            AnyOperationRecord::Transfer(t) => ServerMessage::Result {
+                request_id: t.request_id.clone(),
+                result: agent_remote_protocol::ResultBody::Transfer(
+                    agent_remote_protocol::TransferResult {
+                        operation_id: t.operation_id.clone(),
+                        direction: t.direction,
+                        path: t.path.clone(),
+                        size: t.size,
+                        sha256: t.sha256.clone(),
+                        duration_ms: t.duration_ms,
+                    },
+                ),
+            },
             _ => unreachable!("only committed records are passed"),
         }
     }
@@ -898,6 +923,7 @@ fn record_request_id(r: &AnyOperationRecord) -> Option<&str> {
     match r {
         AnyOperationRecord::Fs(r) => Some(&r.request_id),
         AnyOperationRecord::Exec(r) => Some(&r.request_id),
+        AnyOperationRecord::Transfer(r) => Some(&r.request_id),
         AnyOperationRecord::Prepared(r) => Some(&r.request_id),
         AnyOperationRecord::Aborted(_) => None,
     }

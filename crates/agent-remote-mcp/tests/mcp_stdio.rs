@@ -145,7 +145,7 @@ fn mcp_tools_list_has_expected_tools() {
     let resp = s.call("tools/list", serde_json::json!({}));
     let tools = resp["result"]["tools"].as_array().expect("tools array");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    for expected in [
+    let expected = [
         "list_dir",
         "read_file",
         "stat",
@@ -153,16 +153,17 @@ fn mcp_tools_list_has_expected_tools() {
         "patch_file",
         "delete_file",
         "run_command",
+        "upload_file",
+        "download_file",
         "undo",
         "history",
         "operation_get",
         "request_status",
-    ] {
-        assert!(
-            names.contains(&expected),
-            "missing tool {expected}; have {names:?}"
-        );
+    ];
+    for tool in expected {
+        assert!(names.contains(&tool), "missing tool {tool}; have {names:?}");
     }
+    assert_eq!(names.len(), expected.len(), "unexpected tools: {names:?}");
 }
 
 #[test]
@@ -411,4 +412,112 @@ fn mcp_reconnects_after_server_death() {
 
     let (e, text) = list(&mut s);
     assert!(!e, "call after server death must reconnect, got: {text}");
+}
+
+// upload_file/download_file over real MCP stdio: success round-trip, default
+// no-overwrite failure, and a failing upload all with correct isError.
+#[test]
+fn mcp_transfer_tools_roundtrip_and_errors() {
+    let remote = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let mut s = McpSession::spawn(remote.path().to_str().unwrap());
+    s.call(
+        "initialize",
+        serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0.1"},
+        }),
+    );
+    s.notify("notifications/initialized", serde_json::json!({}));
+
+    let tool = |s: &mut McpSession, name: &str, args: serde_json::Value| -> (bool, String) {
+        let resp = s.call(
+            "tools/call",
+            serde_json::json!({"name": name, "arguments": args}),
+        );
+        let is_err = resp["result"]["isError"].as_bool().unwrap();
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        (is_err, text)
+    };
+
+    // Binary content that read_file/write_file could not carry.
+    let content: Vec<u8> = vec![0x00, 0xFF, 0xFE, 0x00, 0x42];
+    let src = local.path().join("payload.bin");
+    std::fs::write(&src, &content).unwrap();
+
+    let (e, text) = tool(
+        &mut s,
+        "upload_file",
+        serde_json::json!({
+            "local_path": src.to_str().unwrap(),
+            "remote_path": "payload.bin",
+        }),
+    );
+    assert!(!e, "upload failed: {text}");
+    let up: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(up["direction"], "upload");
+    assert_eq!(up["path"], "payload.bin");
+    assert_eq!(up["size"], content.len());
+    assert!(up["operation_id"].as_str().unwrap().starts_with("op-"));
+    assert!(up["sha256"].as_str().unwrap().starts_with("sha256:"));
+    assert!(up["duration_ms"].is_u64());
+    assert!(
+        up.get("staging_path").is_none() && !text.contains(".part"),
+        "staging path leaked into the tool result: {text}"
+    );
+    assert_eq!(
+        std::fs::read(remote.path().join("payload.bin")).unwrap(),
+        content
+    );
+
+    // Default no-overwrite refuses the existing remote target.
+    let (e, text) = tool(
+        &mut s,
+        "upload_file",
+        serde_json::json!({
+            "local_path": src.to_str().unwrap(),
+            "remote_path": "payload.bin",
+        }),
+    );
+    assert!(e, "re-upload without overwrite must be isError=true");
+    assert!(text.contains("overwrite"), "unexpected text: {text}");
+
+    let dest = local.path().join("payload-back.bin");
+    let (e, text) = tool(
+        &mut s,
+        "download_file",
+        serde_json::json!({
+            "remote_path": "payload.bin",
+            "local_path": dest.to_str().unwrap(),
+        }),
+    );
+    assert!(!e, "download failed: {text}");
+    let down: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(down["direction"], "download");
+    assert_eq!(down["path"], dest.to_str().unwrap());
+    assert_eq!(down["sha256"], up["sha256"]);
+    assert_eq!(std::fs::read(&dest).unwrap(), content);
+
+    // Missing local source is a tool error, not a crash.
+    let (e, text) = tool(
+        &mut s,
+        "upload_file",
+        serde_json::json!({
+            "local_path": local.path().join("missing.bin").to_str().unwrap(),
+            "remote_path": "x.bin",
+        }),
+    );
+    assert!(e, "missing local source must be isError=true, got: {text}");
+
+    // The transfer shows up in history as a metadata-only record.
+    let (e, text) = tool(&mut s, "history", serde_json::json!({}));
+    assert!(!e);
+    assert!(
+        text.contains("\"transfer\""),
+        "history missing transfer: {text}"
+    );
 }

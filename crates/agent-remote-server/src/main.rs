@@ -12,8 +12,8 @@ use tracing_subscriber::EnvFilter;
 )]
 struct Args {
     /// Workspace root that all paths are resolved relative to.
-    #[arg(long, required = true)]
-    root: PathBuf,
+    #[arg(long)]
+    root: Option<PathBuf>,
 
     /// Base directory for server state (history, undo blobs, request table).
     /// State lives at `<base>/state/<name>-<hash>`, keyed by the canonical
@@ -30,6 +30,37 @@ struct Args {
     /// pruned at startup and on gc). 0 disables pruning.
     #[arg(long, default_value_t = 1000)]
     history_limit: usize,
+
+    /// Internal raw data plane: stream stdin into this staging file (created
+    /// by upload_prepare on the resident server). Does not open the state
+    /// directory, so it cannot conflict with the resident server's lock.
+    #[arg(long, hide = true, value_name = "STAGING_PATH")]
+    transfer_receive: Option<PathBuf>,
+
+    /// Internal: declared byte count for --transfer-receive.
+    #[arg(long, hide = true, requires = "transfer_receive")]
+    expect_size: Option<u64>,
+
+    /// Internal raw data plane: stream this workspace/@scratch file to stdout
+    /// (JSON size header, raw bytes, JSON sha256 trailer). Requires --root.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "PATH",
+        conflicts_with = "transfer_receive"
+    )]
+    transfer_send: Option<String>,
+}
+
+fn resolve_state_base(state_base: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    match state_base {
+        Some(b) => Ok(b),
+        None => {
+            let home = std::env::var_os("HOME")
+                .ok_or_else(|| anyhow::anyhow!("HOME is not set; pass --state-base"))?;
+            Ok(PathBuf::from(home).join(".agent-remote"))
+        }
+    }
 }
 
 #[tokio::main]
@@ -41,18 +72,29 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let base = match args.state_base {
-        Some(b) => b,
-        None => {
-            let home = std::env::var_os("HOME")
-                .ok_or_else(|| anyhow::anyhow!("HOME is not set; pass --state-base"))?;
-            PathBuf::from(home).join(".agent-remote")
-        }
-    };
-    let state_dir = agent_remote_server::state_dir_under(&base, &args.root)?;
+    if let Some(staging) = args.transfer_receive {
+        let expect_size = args
+            .expect_size
+            .ok_or_else(|| anyhow::anyhow!("--transfer-receive requires --expect-size"))?;
+        return agent_remote_server::transfer::run_transfer_receive(&staging, expect_size);
+    }
+
+    let base = resolve_state_base(args.state_base)?;
+
+    if let Some(path) = args.transfer_send {
+        let root = args
+            .root
+            .ok_or_else(|| anyhow::anyhow!("--transfer-send requires --root"))?;
+        return agent_remote_server::transfer::run_transfer_send(&root, &base, &path);
+    }
+
+    let root = args
+        .root
+        .ok_or_else(|| anyhow::anyhow!("--root is required"))?;
+    let state_dir = agent_remote_server::state_dir_under(&base, &root)?;
 
     let opts = ServerOptions {
-        root: args.root,
+        root,
         state_dir,
         config_path: args.config,
         history_limit: (args.history_limit > 0).then_some(args.history_limit),

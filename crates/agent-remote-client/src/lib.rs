@@ -13,8 +13,10 @@ use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, warn};
 
 mod log_writer;
+mod transfer;
 
 pub use log_writer::ClientLog;
+pub use transfer::{download_file, upload_file, Endpoint};
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -28,6 +30,8 @@ pub enum ClientError {
     Timeout,
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("transfer failed: {0}")]
+    Transfer(String),
 }
 
 type DispMap = Arc<Mutex<std::collections::HashMap<RequestId, oneshot::Sender<ServerMessage>>>>;
@@ -364,6 +368,89 @@ impl Client {
         }
     }
 
+    pub async fn upload_prepare(
+        &self,
+        path: &str,
+        overwrite: bool,
+    ) -> Result<agent_remote_protocol::UploadPrepareResult, ClientError> {
+        let (_, msg) = self
+            .send_request(RequestBody::UploadPrepare {
+                path: path.into(),
+                overwrite,
+            })
+            .await?;
+        match Self::unpack(msg)? {
+            agent_remote_protocol::ResultBody::UploadPrepare(r) => Ok(r),
+            _ => Err(ClientError::Server(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "unexpected result body for upload_prepare",
+            ))),
+        }
+    }
+
+    pub async fn upload_commit(
+        &self,
+        transfer_id: &str,
+        size: u64,
+        sha256: &str,
+        duration_ms: u64,
+    ) -> Result<agent_remote_protocol::TransferResult, ClientError> {
+        let (_, msg) = self
+            .send_request(RequestBody::UploadCommit {
+                transfer_id: transfer_id.into(),
+                size,
+                sha256: sha256.into(),
+                duration_ms,
+            })
+            .await?;
+        match Self::unpack(msg)? {
+            agent_remote_protocol::ResultBody::Transfer(r) => Ok(r),
+            _ => Err(ClientError::Server(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "unexpected result body for upload_commit",
+            ))),
+        }
+    }
+
+    pub async fn upload_abort(&self, transfer_id: &str) -> Result<(), ClientError> {
+        let (_, msg) = self
+            .send_request(RequestBody::UploadAbort {
+                transfer_id: transfer_id.into(),
+            })
+            .await?;
+        match Self::unpack(msg)? {
+            agent_remote_protocol::ResultBody::UploadAbort { .. } => Ok(()),
+            _ => Err(ClientError::Server(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "unexpected result body for upload_abort",
+            ))),
+        }
+    }
+
+    pub async fn download_record(
+        &self,
+        path: &str,
+        size: u64,
+        sha256: &str,
+        duration_ms: u64,
+    ) -> Result<agent_remote_protocol::TransferResult, ClientError> {
+        let (_, msg) = self
+            .send_request(RequestBody::DownloadRecord {
+                path: path.into(),
+                size,
+                sha256: sha256.into(),
+                duration_ms,
+            })
+            .await?;
+        match Self::unpack(msg)? {
+            agent_remote_protocol::ResultBody::Transfer(r) => Ok(r),
+            _ => Err(ClientError::Server(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "unexpected result body for download_record",
+            ))),
+        }
+    }
+
     pub async fn undo(&self, operation_id: &str) -> Result<UndoResult, ClientError> {
         let (_, msg) = self
             .send_request(RequestBody::Undo {
@@ -495,63 +582,6 @@ pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Argv for spawning the server as a local subprocess: plain argv elements,
-/// no shell involved.
-pub fn local_server_argv(
-    server_bin: &str,
-    root: &str,
-    config: Option<&str>,
-    state_base: Option<&str>,
-) -> Vec<String> {
-    let mut argv = vec![server_bin.into(), "--root".into(), root.into()];
-    if let Some(c) = config {
-        argv.push("--config".into());
-        argv.push(c.into());
-    }
-    if let Some(b) = state_base {
-        argv.push("--state-base".into());
-        argv.push(b.into());
-    }
-    argv
-}
-
-/// Build the argv for spawning the server over ssh. `ssh` joins its trailing
-/// arguments with spaces and hands the result to the remote shell, so every
-/// remote-side argument is quoted into one command string.
-pub fn ssh_server_argv(
-    host: &str,
-    remote_bin: &str,
-    root: &str,
-    config: Option<&str>,
-    state_base: Option<&str>,
-) -> Vec<String> {
-    let mut cmd = shell_quote(remote_bin);
-    cmd.push_str(" --root ");
-    cmd.push_str(&shell_quote(root));
-    if let Some(c) = config {
-        cmd.push_str(" --config ");
-        cmd.push_str(&shell_quote(c));
-    }
-    if let Some(b) = state_base {
-        cmd.push_str(" --state-base ");
-        cmd.push_str(&shell_quote(b));
-    }
-    // BatchMode: fail fast instead of hanging on an auth prompt (there is no
-    // tty when spawned by an agent). ServerAlive: keep NAT'd / idle-pruning
-    // connections open across long sessions.
-    vec![
-        "ssh".into(),
-        "-o".into(),
-        "BatchMode=yes".into(),
-        "-o".into(),
-        "ServerAliveInterval=30".into(),
-        "-o".into(),
-        "ServerAliveCountMax=4".into(),
-        host.into(),
-        cmd,
-    ]
-}
-
 /// Request IDs must be globally unique because the server dedupes on them for
 /// idempotent replay. Timestamp separates processes over time, pid separates
 /// concurrent processes, and the counter separates requests within a process.
@@ -568,7 +598,7 @@ fn unique_id() -> String {
 
 #[cfg(test)]
 mod quote_tests {
-    use super::{shell_quote, ssh_server_argv};
+    use super::{shell_quote, Endpoint};
 
     #[test]
     fn quotes_empty_spaces_and_metacharacters() {
@@ -579,15 +609,19 @@ mod quote_tests {
         assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
     }
 
+    fn ssh_endpoint() -> Endpoint {
+        Endpoint::Ssh {
+            host: "host".into(),
+            remote_bin: "agent-remote-server".into(),
+            root: "/data/my project".into(),
+            state_base: Some("/data/sicheng/agent state".into()),
+            config: None,
+        }
+    }
+
     #[test]
     fn ssh_argv_is_one_quoted_remote_command() {
-        let argv = ssh_server_argv(
-            "host",
-            "agent-remote-server",
-            "/data/my project",
-            None,
-            Some("/data/sicheng/agent state"),
-        );
+        let argv = ssh_endpoint().control_argv();
         assert_eq!(argv[0], "ssh");
         // Keepalive/batch options come before the host.
         assert!(argv.contains(&"BatchMode=yes".to_string()));
@@ -595,7 +629,55 @@ mod quote_tests {
         assert_eq!(host_pos, argv.len() - 2, "host is second to last");
         assert_eq!(
             argv[argv.len() - 1],
-            "'agent-remote-server' --root '/data/my project' --state-base '/data/sicheng/agent state'"
+            "'agent-remote-server' '--root' '/data/my project' '--state-base' '/data/sicheng/agent state'"
+        );
+    }
+
+    #[test]
+    fn ssh_transfer_argvs_are_quoted_remote_commands() {
+        let ep = ssh_endpoint();
+        let recv = ep.transfer_receive_argv("/data/my project/.f.x.part", 42);
+        assert_eq!(recv[0], "ssh");
+        assert!(recv.contains(&"BatchMode=yes".to_string()));
+        assert_eq!(
+            recv[recv.len() - 1],
+            "'agent-remote-server' '--transfer-receive' '/data/my project/.f.x.part' '--expect-size' '42'"
+        );
+        let send = ep.transfer_send_argv("@scratch/big file.bin");
+        assert_eq!(
+            send[send.len() - 1],
+            "'agent-remote-server' '--transfer-send' '@scratch/big file.bin' \
+             '--root' '/data/my project' '--state-base' '/data/sicheng/agent state'"
+        );
+    }
+
+    #[test]
+    fn local_argvs_are_plain() {
+        let ep = Endpoint::Local {
+            server_bin: "/bin/agent-remote-server".into(),
+            root: "/ws".into(),
+            state_base: None,
+            config: Some("/cfg.toml".into()),
+        };
+        assert_eq!(
+            ep.control_argv(),
+            vec![
+                "/bin/agent-remote-server",
+                "--root",
+                "/ws",
+                "--config",
+                "/cfg.toml"
+            ]
+        );
+        assert_eq!(
+            ep.transfer_send_argv("f.bin"),
+            vec![
+                "/bin/agent-remote-server",
+                "--transfer-send",
+                "f.bin",
+                "--root",
+                "/ws"
+            ]
         );
     }
 }
