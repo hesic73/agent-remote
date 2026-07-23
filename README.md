@@ -152,12 +152,21 @@ machine:
 host = "robot@workstation"        # omit host to run on the local machine
 root = "/home/robot/project"
 bin  = "/home/robot/.local/bin/agent-remote-server"  # optional, default: on PATH
+label = "ROS workspace"           # optional, shown by list_workspaces
 # config / state_base optional, same meaning as the server flags
 
 [workspaces.lab-gpu]
 host = "lab-gpu-1"
 root = "/data/experiments"
 ```
+
+`agent-remote-mcp --check` diagnoses the fleet without starting the MCP:
+it validates the config, probes every workspace once (spawns its server,
+one real round-trip), prints per-workspace status, and exits nonzero if
+anything is unhealthy. Connection-class tool errors carry stable codes --
+`unknown_workspace`, `connect_failed` (transport/spawn), `probe_failed`
+(server spawned but the round-trip died, e.g. missing root or a locked
+state directory) -- so a failing call tells you which layer broke.
 
 ```bash
 # Claude Code example: one MCP entry serves every workspace

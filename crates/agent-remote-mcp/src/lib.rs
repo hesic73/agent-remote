@@ -34,12 +34,21 @@ struct WorkspaceEntry {
     bin: Option<String>,
     config: Option<String>,
     state_base: Option<String>,
+    /// Human-readable description shown by list_workspaces, for telling apart
+    /// entries whose names alone are ambiguous.
+    label: Option<String>,
+}
+
+/// A configured workspace: where its server runs, plus display metadata.
+pub struct Workspace {
+    pub endpoint: Endpoint,
+    pub label: Option<String>,
 }
 
 /// Parse and validate a fleet config. Rejects an empty fleet and two
 /// workspaces addressing the same (host, root): they would contend for the
 /// same server-side state lock and one of them would always fail.
-pub fn parse_fleet(text: &str) -> anyhow::Result<BTreeMap<String, Endpoint>> {
+pub fn parse_fleet(text: &str) -> anyhow::Result<BTreeMap<String, Workspace>> {
     let file: FleetFile = toml::from_str(text)?;
     if file.workspaces.is_empty() {
         anyhow::bail!("fleet config declares no workspaces");
@@ -69,9 +78,34 @@ pub fn parse_fleet(text: &str) -> anyhow::Result<BTreeMap<String, Endpoint>> {
                 config: entry.config,
             },
         };
-        out.insert(name, endpoint);
+        out.insert(
+            name,
+            Workspace {
+                endpoint,
+                label: entry.label,
+            },
+        );
     }
     Ok(out)
+}
+
+/// One-shot health probe of a workspace: spawn its server and do a real
+/// round-trip. Single attempt, no retries -- this is a diagnostic, not the
+/// resilient tool-call path. The error text starts with a stable code:
+/// `connect_failed` (transport/spawn) or `probe_failed` (server reached but
+/// the round-trip failed, e.g. bad root or a locked state directory -- see
+/// the server's stderr above for its own explanation).
+pub async fn check_workspace(endpoint: &Endpoint) -> Result<(), String> {
+    let transport = agent_remote_client::ArgvTransport {
+        argv: endpoint.control_argv(),
+    };
+    match Client::connect(transport, None).await {
+        Err(e) => Err(format!("connect_failed: {e}")),
+        Ok(c) => match c.stat(".").await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("probe_failed: {e}")),
+        },
+    }
 }
 
 // ---- Helpers ----
@@ -263,6 +297,7 @@ pub struct DownloadFileInput {
 /// other workspaces.
 struct WorkspaceHandle {
     endpoint: Endpoint,
+    label: Option<String>,
     /// Current connection. A Client never recovers once its transport dies
     /// (e.g. sshd resetting the connection), so tool calls fetch it through
     /// `client()`, which reconnects on demand.
@@ -278,14 +313,15 @@ const CONNECT_ATTEMPTS: u32 = 4;
 const CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl RemoteWorkspaceServer {
-    pub fn new(fleet: BTreeMap<String, Endpoint>) -> Self {
+    pub fn new(fleet: BTreeMap<String, Workspace>) -> Self {
         let workspaces = fleet
             .into_iter()
-            .map(|(name, endpoint)| {
+            .map(|(name, ws)| {
                 (
                     name,
                     WorkspaceHandle {
-                        endpoint,
+                        endpoint: ws.endpoint,
+                        label: ws.label,
                         slot: tokio::sync::Mutex::new(None),
                     },
                 )
@@ -302,7 +338,7 @@ impl RemoteWorkspaceServer {
                 .map(|s| s.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("unknown workspace '{workspace}'; available workspaces: {names}")
+            format!("unknown_workspace: '{workspace}' is not a configured workspace; available workspaces: {names}")
         })
     }
 
@@ -318,6 +354,10 @@ impl RemoteWorkspaceServer {
                 return Ok((c.clone(), handle));
             }
         }
+        // `code` is a stable keyword so agents can tell transport failures
+        // (connect_failed) apart from a reachable-but-unhealthy workspace
+        // (probe_failed: server spawned, the round-trip did not survive).
+        let mut code = "connect_failed";
         let mut last = String::new();
         for attempt in 1..=CONNECT_ATTEMPTS {
             if attempt > 1 {
@@ -333,13 +373,19 @@ impl RemoteWorkspaceServer {
                         *slot = Some(c.clone());
                         return Ok((c, handle));
                     }
-                    Err(e) => last = format!("attempt {attempt}: connection probe failed: {e}"),
+                    Err(e) => {
+                        code = "probe_failed";
+                        last = format!("attempt {attempt}: {e}");
+                    }
                 },
-                Err(e) => last = format!("attempt {attempt}: connect failed: {e}"),
+                Err(e) => {
+                    code = "connect_failed";
+                    last = format!("attempt {attempt}: {e}");
+                }
             }
         }
         Err(format!(
-            "cannot reach workspace '{workspace}' after {CONNECT_ATTEMPTS} attempts ({last})"
+            "{code}: cannot reach workspace '{workspace}' after {CONNECT_ATTEMPTS} attempts ({last})"
         ))
     }
 }
@@ -358,7 +404,11 @@ impl RemoteWorkspaceServer {
                     Endpoint::Ssh { host, root, .. } => (host.as_str(), root.as_str()),
                     Endpoint::Local { root, .. } => ("(local)", root.as_str()),
                 };
-                serde_json::json!({"name": name, "host": host, "root": root})
+                let mut row = serde_json::json!({"name": name, "host": host, "root": root});
+                if let Some(label) = &h.label {
+                    row["label"] = serde_json::Value::String(label.clone());
+                }
+                row
             })
             .collect();
         match serde_json::to_string_pretty(&rows) {

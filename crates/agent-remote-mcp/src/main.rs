@@ -17,6 +17,12 @@ struct Cli {
     /// ~/.agent-remote/workspaces.toml.
     #[arg(long)]
     fleet: Option<PathBuf>,
+
+    /// Diagnostic mode: validate the fleet config, probe every workspace once
+    /// (spawn its server, one real round-trip), report per-workspace status,
+    /// and exit nonzero if any workspace is unhealthy.
+    #[arg(long)]
+    check: bool,
 }
 
 #[tokio::main]
@@ -40,6 +46,32 @@ async fn main() -> Result<()> {
         .with_context(|| format!("read fleet config {fleet_path:?}; create it or pass --fleet"))?;
     let fleet = agent_remote_mcp::parse_fleet(&text)
         .with_context(|| format!("invalid fleet config {fleet_path:?}"))?;
+
+    if cli.check {
+        println!(
+            "fleet config {} ok: {} workspace(s)",
+            fleet_path.display(),
+            fleet.len()
+        );
+        let mut unhealthy = 0;
+        for (name, ws) in &fleet {
+            let location = match &ws.endpoint {
+                agent_remote_client::Endpoint::Ssh { host, root, .. } => format!("{host}:{root}"),
+                agent_remote_client::Endpoint::Local { root, .. } => format!("(local):{root}"),
+            };
+            match agent_remote_mcp::check_workspace(&ws.endpoint).await {
+                Ok(()) => println!("{name} [{location}]: ok"),
+                Err(e) => {
+                    unhealthy += 1;
+                    println!("{name} [{location}]: {e}");
+                }
+            }
+        }
+        if unhealthy > 0 {
+            anyhow::bail!("{unhealthy} workspace(s) unhealthy");
+        }
+        return Ok(());
+    }
 
     // No eager connect: initialize must answer immediately (a blocking retry
     // loop here makes the MCP host time the server out, e.g. when a session

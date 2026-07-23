@@ -197,6 +197,59 @@ fn mcp_rejects_invalid_fleet_configs() {
     }
 }
 
+// --check probes each workspace once and reports per-workspace health with
+// stable error codes, exiting nonzero when any workspace is unhealthy.
+#[test]
+fn mcp_check_reports_per_workspace_health() {
+    let good = tempfile::tempdir().unwrap();
+    let fleet = good.path().join("check.toml");
+
+    // All healthy: exit 0, every workspace reported ok.
+    std::fs::write(&fleet, fleet_entry("good", good.path().to_str().unwrap())).unwrap();
+    let out = Command::new(mcp_bin())
+        .args(["--fleet", &fleet.to_string_lossy(), "--check"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "healthy fleet must pass: {stdout}");
+    assert!(
+        stdout.contains("good [") && stdout.contains(": ok"),
+        "{stdout}"
+    );
+
+    // One workspace with a nonexistent root: the check still runs the healthy
+    // one, reports the broken one with a stable code, and exits nonzero.
+    std::fs::write(
+        &fleet,
+        format!(
+            "{}{}",
+            fleet_entry("good", good.path().to_str().unwrap()),
+            fleet_entry("broken", "/nonexistent-agent-remote-root")
+        ),
+    )
+    .unwrap();
+    let out = Command::new(mcp_bin())
+        .args(["--fleet", &fleet.to_string_lossy(), "--check"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success(),
+        "broken workspace must fail the check"
+    );
+    assert!(
+        stdout.contains("good [") && stdout.contains(": ok"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("broken [")
+            && (stdout.contains("probe_failed") || stdout.contains("connect_failed")),
+        "broken workspace must be reported with a stable code: {stdout}"
+    );
+}
+
 #[test]
 fn mcp_tools_list_has_expected_tools() {
     let dir = tempfile::tempdir().unwrap();
@@ -292,8 +345,8 @@ fn mcp_unknown_workspace_is_a_clear_error() {
     );
     assert!(e, "unknown workspace must be isError=true");
     assert!(
-        text.contains("unknown workspace 'nope'") && text.contains("test"),
-        "error must name the bad workspace and list the available ones: {text}"
+        text.contains("unknown_workspace") && text.contains("'nope'") && text.contains("test"),
+        "error must carry the stable code, the bad name, and the available names: {text}"
     );
 }
 
@@ -325,7 +378,7 @@ fn mcp_workspaces_are_isolated() {
     std::fs::write(
         &fleet,
         format!(
-            "{}{}",
+            "{}label = \"Workspace A\"\n{}",
             fleet_entry("a", dir_a.path().to_str().unwrap()),
             fleet_entry("b", dir_b.path().to_str().unwrap())
         ),
@@ -346,6 +399,12 @@ fn mcp_workspaces_are_isolated() {
     assert_eq!(names, vec!["a", "b"]);
     assert_eq!(rows[0]["host"], "(local)");
     assert_eq!(rows[0]["root"], dir_a.path().to_str().unwrap());
+    assert_eq!(rows[0]["label"], "Workspace A");
+    assert!(
+        rows[1].get("label").is_none(),
+        "label must be omitted when unset: {}",
+        rows[1]
+    );
 
     let (e, _) = s.tool(
         "write_file",
