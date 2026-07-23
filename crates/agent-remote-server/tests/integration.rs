@@ -3134,3 +3134,151 @@ async fn delete_roundtrip_undo_and_errors() {
         other => panic!("unexpected: {other:?}"),
     }
 }
+
+// Without a profile the argv is spawned directly: no shell means no word
+// splitting, expansion, or quoting hazards.
+#[tokio::test]
+async fn exec_without_profile_spawns_argv_directly() {
+    let mut h = harness().await;
+    let hostile = "a b'c\"d$HOME`id`\nnewline";
+    h.send(&req(
+        "e",
+        RequestBody::Exec {
+            argv: vec!["printf".into(), "%s".into(), hostile.into()],
+            cwd: None,
+            profile: None,
+            timeout_ms: Some(10000),
+        },
+    ));
+    let msgs = h.recv_all_for("e").await;
+    match &msgs[0] {
+        ServerMessage::Result {
+            result: ResultBody::Exec(r),
+            ..
+        } => {
+            assert_eq!(r.termination, ExecTermination::Exited { code: 0 });
+            assert_eq!(r.stdout.prefix, hostile, "argv must pass through verbatim");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+// A nonexistent command without a profile is a rejected spawn, not a shell's
+// exit 127.
+#[tokio::test]
+async fn exec_without_profile_missing_command_rejected() {
+    let mut h = harness().await;
+    h.send(&req(
+        "e",
+        RequestBody::Exec {
+            argv: vec!["definitely-not-a-command-xyz".into()],
+            cwd: None,
+            profile: None,
+            timeout_ms: Some(10000),
+        },
+    ));
+    assert!(matches!(
+        h.recv().await,
+        ServerMessage::Error {
+            error: ProtocolError {
+                code: ErrorCode::ExecFailed,
+                ..
+            },
+            ..
+        }
+    ));
+}
+
+// A profile with an empty setup must still run through the profile's shell:
+// the shell choice itself is the point. Using `echo` as the "shell" makes the
+// generated script observable as output.
+#[tokio::test]
+async fn profile_with_empty_setup_still_uses_its_shell() {
+    let cfg = r#"
+[profiles.echoer]
+shell = ["echo"]
+setup = ""
+"#;
+    let mut h = harness_with_config(Some(cfg)).await;
+    h.send(&req(
+        "e",
+        RequestBody::Exec {
+            argv: vec!["hi".into()],
+            cwd: None,
+            profile: Some("echoer".into()),
+            timeout_ms: Some(10000),
+        },
+    ));
+    let msgs = h.recv_all_for("e").await;
+    match &msgs[0] {
+        ServerMessage::Result {
+            result: ResultBody::Exec(r),
+            ..
+        } => {
+            assert_eq!(r.termination, ExecTermination::Exited { code: 0 });
+            assert_eq!(r.stdout.prefix.trim(), "exec 'hi'");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+// default_profile applies when the request names no profile; an explicit
+// profile overrides it.
+#[tokio::test]
+async fn default_profile_applies_and_explicit_overrides() {
+    let cfg = r#"
+default_profile = "main"
+
+[profiles.main]
+setup = "export MARKER=via-default"
+
+[profiles.other]
+shell = ["sh", "-c"]
+setup = "export MARKER=via-override"
+"#;
+    let mut h = harness_with_config(Some(cfg)).await;
+    for (rid, profile, expected) in [
+        ("d", None, "via-default"),
+        ("o", Some("other".to_string()), "via-override"),
+    ] {
+        h.send(&req(
+            rid,
+            RequestBody::Exec {
+                argv: vec!["printenv".into(), "MARKER".into()],
+                cwd: None,
+                profile,
+                timeout_ms: Some(10000),
+            },
+        ));
+        let msgs = h.recv_all_for(rid).await;
+        match &msgs[0] {
+            ServerMessage::Result {
+                result: ResultBody::Exec(r),
+                ..
+            } => assert_eq!(r.stdout.prefix.trim(), expected),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+}
+
+// A config written for a newer server (unknown fields) must fail startup
+// loudly instead of silently running commands in the wrong environment.
+#[tokio::test]
+async fn server_startup_rejects_config_with_unknown_fields() {
+    for bad in [
+        "default_profile = \"ghost\"\n",
+        "[profiles.p]\nsetup = \"\"\nfuture_field = 1\n",
+        "[profiles.p]\nshell = []\nsetup = \"\"\n",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("config.toml");
+        std::fs::write(&config_path, bad).unwrap();
+        let result = Server::new(ServerOptions {
+            root: root.path().to_path_buf(),
+            state_dir: root.path().join(".agent-remote"),
+            config_path: Some(config_path),
+            history_limit: None,
+        });
+        assert!(result.is_err(), "config must be rejected at startup: {bad}");
+    }
+}

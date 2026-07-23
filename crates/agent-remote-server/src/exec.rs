@@ -49,7 +49,7 @@ pub async fn exec(
             format!("timeout_ms must be between 1 and {MAX_TIMEOUT_MS}"),
         ));
     }
-    let setup = config.setup_for(profile)?;
+    let resolved_profile = config.profile_for(profile)?;
     let working_dir = match cwd {
         Some(c) => ws.resolve(c)?,
         None => ws.root.clone(),
@@ -61,19 +61,30 @@ pub async fn exec(
         ));
     }
 
-    let quoted: Vec<String> = argv.iter().map(|a| shell_quote(a)).collect();
-    // Profiles are shell snippets, so every invocation runs through bash and
-    // then replaces it with the requested argv for direct signal delivery.
-    let script = if setup.is_empty() {
-        format!("exec {}", quoted.join(" "))
-    } else {
-        format!("{setup}\nexec {}", quoted.join(" "))
+    // Without a profile the argv is spawned directly, no shell involved. A
+    // profile (explicit or default) always runs through ITS shell -- even
+    // with an empty setup, since the shell choice itself (e.g. `zsh -lic`
+    // loading the user's real environment) is the point -- and ends in exec
+    // so signals reach the real command.
+    let mut cmd = match resolved_profile {
+        None => {
+            let mut c = Command::new(&argv[0]);
+            c.args(&argv[1..]);
+            c
+        }
+        Some(p) => {
+            let quoted: Vec<String> = argv.iter().map(|a| shell_quote(a)).collect();
+            let script = if p.setup.is_empty() {
+                format!("exec {}", quoted.join(" "))
+            } else {
+                format!("{}\nexec {}", p.setup, quoted.join(" "))
+            };
+            let mut c = Command::new(&p.shell[0]);
+            c.args(&p.shell[1..]).arg(script);
+            c
+        }
     };
-
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c")
-        .arg(&script)
-        .current_dir(&working_dir)
+    cmd.current_dir(&working_dir)
         .env("AGENT_REMOTE_SCRATCH", &ws.scratch_root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

@@ -64,13 +64,34 @@ and are re-applied for every `exec`, so commands stay stateless:
 
 ```toml
 # on the remote host; point the server at it with --config
+default_profile = "user-zsh"      # applied when a request names no profile
+
+[profiles.user-zsh]
+shell = ["zsh", "-lic"]           # load the user's real shell environment
+setup = ""
+
 [profiles.robot]
 setup = """
 source /opt/miniconda3/etc/profile.d/conda.sh
 conda activate robot
 source /opt/ros/humble/setup.bash
 """
+
+[profiles.raw]
+setup = ""                        # escape hatch from default_profile
 ```
+
+Without a profile (and with no `default_profile`), the argv is spawned
+directly -- no shell involved. With a profile, the command runs through that
+profile's `shell` (default `["bash", "-c"]`): the server appends a script of
+the profile's `setup` followed by `exec <argv>` as the shell's final
+argument, so the profile picks the environment while signals still reach the
+real command. `shell = ["zsh", "-lic"]` loads your actual `.zprofile`/
+`.zshrc` (they must behave without a tty), which is usually all a "get my
+conda/proxy/PATH right" profile needs. Config parsing is strict: unknown
+fields, an empty `shell`, or a `default_profile` naming no declared profile
+all fail server startup instead of silently running commands in the wrong
+environment.
 
 ## CLI subcommands
 

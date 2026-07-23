@@ -59,6 +59,12 @@ Environment setup (conda, ROS, ...) is re-applied per command via server-side
 profiles:
 
 ```toml
+default_profile = "user-zsh"
+
+[profiles.user-zsh]
+shell = ["zsh", "-lic"]
+setup = ""
+
 [profiles.robot]
 setup = """
 source /mnt/data/miniconda3/etc/profile.d/conda.sh
@@ -66,6 +72,18 @@ conda activate robot
 source /opt/ros/humble/setup.bash
 """
 ```
+
+A profile owns two things and nothing more: which shell to start (`shell`,
+default `["bash", "-c"]`; the server appends `setup` + `exec <argv>` as the
+final argument) and what to run before the command (`setup`). Choosing
+`["zsh", "-lic"]` reuses the user's own login/interactive configuration
+instead of teaching the server about conda or ROS -- the server never
+understands toolchains, it only picks a shell and execs through it. Without
+any profile (explicit or `default_profile`), the argv is spawned directly
+with no shell at all. Config parsing is strict (`deny_unknown_fields`, empty
+shells and undeclared defaults rejected at startup): an older server reading
+a newer config must fail loudly, never silently run commands in the wrong
+environment.
 
 There is no server-side `cd`; every request carries explicit paths or `cwd`.
 Interactive sessions (PTY, REPL, persistent shell) are out of scope.
