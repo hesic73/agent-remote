@@ -299,9 +299,21 @@ Tests live inside each crate: protocol round-trips, in-process server tests,
 end-to-end tests that spawn the real server binary over stdio, and MCP tests
 that drive the real `agent-remote-mcp` binary.
 
-## MVP status
+## Status
 
-All criteria are implemented and tested:
+Post-MVP additions, all implemented and tested:
+
+* [x] Raw streaming file transfer (`upload_file`/`download_file`): dedicated
+  per-transfer data plane, atomic install, SHA-256 verified both ways,
+  metadata-only records
+* [x] Fleet MCP: one server process multiplexes named workspaces across
+  machines, required `workspace` argument, `list_workspaces`
+* [x] `--check` diagnostics and stable connection error codes
+  (`unknown_workspace` / `connect_failed` / `probe_failed`)
+* [x] Profiles choose their shell (`shell = ["zsh", "-lic"]`),
+  `default_profile`, strict config parsing; no profile means direct spawn
+
+The original MVP criteria, all implemented and tested:
 
 * [x] Persistent SSH stdio session from client to server
 * [x] `list`, `stat`, `read`, `write`, `patch`, `delete`, `exec`

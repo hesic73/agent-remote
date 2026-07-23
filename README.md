@@ -23,8 +23,9 @@ cargo build --release
 #   target/release/agent-remote-mcp    (MCP server for coding agents)
 ```
 
-Copy `agent-remote-server` onto the remote host (anywhere on `PATH`, or pass
-its full path with `--remote-bin`).
+Copy `agent-remote-server` onto the remote host: anywhere on `PATH`, or
+point at its full path (the CLI's `--remote-bin` flag; the fleet config's
+`bin` field for the MCP).
 
 If the remote's glibc is older than your build machine's, build the server as
 a fully static musl binary instead — it runs anywhere on the same

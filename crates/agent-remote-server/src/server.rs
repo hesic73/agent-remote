@@ -152,39 +152,31 @@ impl Server {
         // (requests.jsonl included), and the in-memory upload registry dies
         // with this process, so replaying either after a reconnect could not
         // succeed anyway.
-        match &req.body {
-            RequestBody::UploadPrepare { path, overwrite } => {
-                let result =
-                    transfer::upload_prepare(&self.workspace, &self.uploads, path, *overwrite);
-                let msg = match result {
-                    Ok(body) => ServerMessage::Result {
-                        request_id,
-                        result: body,
-                    },
-                    Err(e) => ServerMessage::Error {
-                        request_id,
-                        error: e,
-                    },
-                };
-                write_line(&stdout, &msg).await;
-                return;
-            }
+        let unpersisted = match &req.body {
+            RequestBody::UploadPrepare { path, overwrite } => Some(transfer::upload_prepare(
+                &self.workspace,
+                &self.uploads,
+                path,
+                *overwrite,
+            )),
             RequestBody::UploadAbort { transfer_id } => {
-                let result = transfer::upload_abort(&self.uploads, transfer_id);
-                let msg = match result {
-                    Ok(body) => ServerMessage::Result {
-                        request_id,
-                        result: body,
-                    },
-                    Err(e) => ServerMessage::Error {
-                        request_id,
-                        error: e,
-                    },
-                };
-                write_line(&stdout, &msg).await;
-                return;
+                Some(transfer::upload_abort(&self.uploads, transfer_id))
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some(result) = unpersisted {
+            let msg = match result {
+                Ok(body) => ServerMessage::Result {
+                    request_id,
+                    result: body,
+                },
+                Err(e) => ServerMessage::Error {
+                    request_id,
+                    error: e,
+                },
+            };
+            write_line(&stdout, &msg).await;
+            return;
         }
 
         // Idempotency via atomic claim: if we have seen this request_id, replay

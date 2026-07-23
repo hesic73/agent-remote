@@ -188,15 +188,13 @@ fn spawn_transfer_child(argv: &[String]) -> std::io::Result<tokio::process::Chil
 
 /// Upload a local file to `remote_path` (workspace-relative or `@scratch/...`)
 /// by streaming raw bytes through a dedicated receiver process, then
-/// atomically installing on the remote. `progress` is called with cumulative
-/// bytes sent after each chunk.
+/// atomically installing on the remote.
 pub async fn upload_file(
     client: &Client,
     endpoint: &Endpoint,
     local_path: &Path,
     remote_path: &str,
     overwrite: bool,
-    progress: Option<&(dyn Fn(u64) + Send + Sync)>,
 ) -> Result<TransferResult, ClientError> {
     let start = std::time::Instant::now();
     let meta = tokio::fs::metadata(local_path)
@@ -213,8 +211,7 @@ pub async fn upload_file(
 
     // From here on every failure must abort the prepared upload so the remote
     // staging file is cleaned up.
-    let streamed =
-        stream_to_receiver(endpoint, local_path, size, &prep.staging_path, progress).await;
+    let streamed = stream_to_receiver(endpoint, local_path, size, &prep.staging_path).await;
     let sha256 = match streamed {
         Ok(sha256) => sha256,
         Err(e) => return Err(abort_after(client, &prep.transfer_id, e).await),
@@ -237,7 +234,6 @@ async fn stream_to_receiver(
     local_path: &Path,
     size: u64,
     staging_path: &str,
-    progress: Option<&(dyn Fn(u64) + Send + Sync)>,
 ) -> Result<String, ClientError> {
     let argv = endpoint.transfer_receive_argv(staging_path, size);
     let mut child = spawn_transfer_child(&argv)
@@ -266,9 +262,6 @@ async fn stream_to_receiver(
                 .await
                 .map_err(|e| transfer_err(format!("write to receiver: {e}")))?;
             sent += n as u64;
-            if let Some(p) = progress {
-                p(sent);
-            }
         }
         if sent != size {
             return Err(transfer_err(format!(
@@ -336,7 +329,6 @@ pub async fn download_file(
     remote_path: &str,
     local_path: &Path,
     overwrite: bool,
-    progress: Option<&(dyn Fn(u64) + Send + Sync)>,
 ) -> Result<TransferResult, ClientError> {
     let start = std::time::Instant::now();
     let parent = local_path
@@ -377,7 +369,7 @@ pub async fn download_file(
     drop(child.stdin.take());
     let mut reader = BufReader::new(child.stdout.take().expect("piped stdout"));
 
-    let received = receive_stream(&mut reader, tmp.as_file(), progress).await;
+    let received = receive_stream(&mut reader, tmp.as_file()).await;
     let status = child
         .wait()
         .await
@@ -426,7 +418,6 @@ pub async fn download_file(
 async fn receive_stream(
     reader: &mut BufReader<tokio::process::ChildStdout>,
     out: &std::fs::File,
-    progress: Option<&(dyn Fn(u64) + Send + Sync)>,
 ) -> Result<(u64, String), ClientError> {
     use std::io::Write;
 
@@ -461,9 +452,6 @@ async fn receive_stream(
         out.write_all(&buf[..n])
             .map_err(|e| transfer_err(format!("write local temp file: {e}")))?;
         remaining -= n as u64;
-        if let Some(p) = progress {
-            p(header.size - remaining);
-        }
     }
 
     let mut trailer = String::new();

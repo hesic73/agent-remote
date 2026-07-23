@@ -619,7 +619,6 @@ impl RemoteWorkspaceServer {
             std::path::Path::new(&local_path),
             &remote_path,
             overwrite.unwrap_or(false),
-            None,
         )
         .await
         {
@@ -650,7 +649,6 @@ impl RemoteWorkspaceServer {
             &remote_path,
             std::path::Path::new(&local_path),
             overwrite.unwrap_or(false),
-            None,
         )
         .await
         {

@@ -61,7 +61,7 @@ async fn upload_download_small_text_roundtrip() {
     let src = local.path().join("src.txt");
     std::fs::write(&src, content).unwrap();
 
-    let up = upload_file(&client, &ep, &src, "data.txt", false, None)
+    let up = upload_file(&client, &ep, &src, "data.txt", false)
         .await
         .unwrap();
     assert!(up.operation_id.starts_with("op-"));
@@ -75,7 +75,7 @@ async fn upload_download_small_text_roundtrip() {
     );
 
     let dest = local.path().join("back.txt");
-    let down = download_file(&client, &ep, "data.txt", &dest, false, None)
+    let down = download_file(&client, &ep, "data.txt", &dest, false)
         .await
         .unwrap();
     assert!(matches!(down.direction, TransferDirection::Download));
@@ -102,7 +102,7 @@ async fn binary_larger_than_buffer_roundtrips_via_scratch() {
     let src = local.path().join("blob.bin");
     std::fs::write(&src, &content).unwrap();
 
-    let up = upload_file(&client, &ep, &src, "@scratch/blob.bin", false, None)
+    let up = upload_file(&client, &ep, &src, "@scratch/blob.bin", false)
         .await
         .unwrap();
     assert_eq!(up.path, "@scratch/blob.bin");
@@ -110,7 +110,7 @@ async fn binary_larger_than_buffer_roundtrips_via_scratch() {
     assert_eq!(up.sha256, sha256_of(&content));
 
     let dest = local.path().join("blob-back.bin");
-    let down = download_file(&client, &ep, "@scratch/blob.bin", &dest, false, None)
+    let down = download_file(&client, &ep, "@scratch/blob.bin", &dest, false)
         .await
         .unwrap();
     assert_eq!(down.size, up.size);
@@ -127,12 +127,12 @@ async fn upload_refuses_then_overwrites_existing_target() {
 
     let src = local.path().join("v.txt");
     std::fs::write(&src, "v1").unwrap();
-    upload_file(&client, &ep, &src, "v.txt", false, None)
+    upload_file(&client, &ep, &src, "v.txt", false)
         .await
         .unwrap();
 
     std::fs::write(&src, "v2").unwrap();
-    let err = upload_file(&client, &ep, &src, "v.txt", false, None)
+    let err = upload_file(&client, &ep, &src, "v.txt", false)
         .await
         .unwrap_err();
     match err {
@@ -147,7 +147,7 @@ async fn upload_refuses_then_overwrites_existing_target() {
         "v1"
     );
 
-    upload_file(&client, &ep, &src, "v.txt", true, None)
+    upload_file(&client, &ep, &src, "v.txt", true)
         .await
         .unwrap();
     assert_eq!(
@@ -168,7 +168,7 @@ async fn download_refuses_then_overwrites_existing_target() {
     let dest = local.path().join("d.txt");
     std::fs::write(&dest, "precious local").unwrap();
 
-    let err = download_file(&client, &ep, "r.txt", &dest, false, None)
+    let err = download_file(&client, &ep, "r.txt", &dest, false)
         .await
         .unwrap_err();
     assert!(
@@ -177,7 +177,7 @@ async fn download_refuses_then_overwrites_existing_target() {
     );
     assert_eq!(std::fs::read_to_string(&dest).unwrap(), "precious local");
 
-    download_file(&client, &ep, "r.txt", &dest, true, None)
+    download_file(&client, &ep, "r.txt", &dest, true)
         .await
         .unwrap();
     assert_eq!(std::fs::read_to_string(&dest).unwrap(), "remote");
@@ -194,7 +194,7 @@ async fn upload_missing_parents_and_sources_fail() {
     std::fs::write(&src, "x").unwrap();
 
     // Remote parent directory missing: no implicit mkdir.
-    let err = upload_file(&client, &ep, &src, "no_such_dir/f.txt", false, None)
+    let err = upload_file(&client, &ep, &src, "no_such_dir/f.txt", false)
         .await
         .unwrap_err();
     match err {
@@ -203,20 +203,13 @@ async fn upload_missing_parents_and_sources_fail() {
     }
 
     // Local source missing.
-    let err = upload_file(
-        &client,
-        &ep,
-        &local.path().join("nope.txt"),
-        "f.txt",
-        false,
-        None,
-    )
-    .await
-    .unwrap_err();
+    let err = upload_file(&client, &ep, &local.path().join("nope.txt"), "f.txt", false)
+        .await
+        .unwrap_err();
     assert!(matches!(err, ClientError::Transfer(_)));
 
     // Local source is a directory.
-    let err = upload_file(&client, &ep, local.path(), "f.txt", false, None)
+    let err = upload_file(&client, &ep, local.path(), "f.txt", false)
         .await
         .unwrap_err();
     assert!(
@@ -237,7 +230,7 @@ async fn upload_rejects_symlink_ancestor_escape() {
 
     let src = local.path().join("s.txt");
     std::fs::write(&src, "x").unwrap();
-    let err = upload_file(&client, &ep, &src, "escape/f.txt", false, None)
+    let err = upload_file(&client, &ep, &src, "escape/f.txt", false)
         .await
         .unwrap_err();
     match err {
@@ -261,7 +254,6 @@ async fn download_missing_source_dir_source_and_missing_parent_fail() {
         "missing.bin",
         &local.path().join("d.bin"),
         false,
-        None,
     )
     .await
     .unwrap_err();
@@ -269,16 +261,9 @@ async fn download_missing_source_dir_source_and_missing_parent_fail() {
 
     // Remote source is a directory.
     std::fs::create_dir(remote.path().join("adir")).unwrap();
-    let err = download_file(
-        &client,
-        &ep,
-        "adir",
-        &local.path().join("d2.bin"),
-        false,
-        None,
-    )
-    .await
-    .unwrap_err();
+    let err = download_file(&client, &ep, "adir", &local.path().join("d2.bin"), false)
+        .await
+        .unwrap_err();
     assert!(matches!(err, ClientError::Transfer(_)));
 
     // Local parent directory missing.
@@ -289,7 +274,6 @@ async fn download_missing_source_dir_source_and_missing_parent_fail() {
         "ok.bin",
         &local.path().join("no_dir/d.bin"),
         false,
-        None,
     )
     .await
     .unwrap_err();
@@ -400,7 +384,7 @@ async fn child_death_mid_transfer_leaves_no_target_or_temp_files() {
 
     std::fs::write(remote.path().join("r.bin"), vec![7u8; 100]).unwrap();
     let dest = local.path().join("d.bin");
-    let err = download_file(&client, &broken_ep, "r.bin", &dest, false, None)
+    let err = download_file(&client, &broken_ep, "r.bin", &dest, false)
         .await
         .unwrap_err();
     assert!(matches!(err, ClientError::Transfer(_)));
@@ -411,7 +395,7 @@ async fn child_death_mid_transfer_leaves_no_target_or_temp_files() {
     // remote staging file must be cleaned via upload_abort.
     let src = local.path().join("s.bin");
     std::fs::write(&src, vec![9u8; 200_000]).unwrap();
-    let err = upload_file(&client, &broken_ep, &src, "u.bin", false, None)
+    let err = upload_file(&client, &broken_ep, &src, "u.bin", false)
         .await
         .unwrap_err();
     assert!(matches!(err, ClientError::Transfer(_)));
@@ -472,11 +456,11 @@ async fn transfers_appear_in_history_without_undo_or_leaked_paths() {
     let src = local.path().join("secret-local-name.txt");
     std::fs::write(&src, marker).unwrap();
 
-    let up = upload_file(&client, &ep, &src, "pub.txt", false, None)
+    let up = upload_file(&client, &ep, &src, "pub.txt", false)
         .await
         .unwrap();
     let dest = local.path().join("secret-dest-name.txt");
-    let down = download_file(&client, &ep, "pub.txt", &dest, false, None)
+    let down = download_file(&client, &ep, "pub.txt", &dest, false)
         .await
         .unwrap();
 
@@ -565,13 +549,13 @@ async fn large_file_roundtrip_uses_bounded_memory() {
     }
     let before_kib = vm_hwm_kib();
 
-    let up = upload_file(&client, &ep, &src, "@scratch/big.bin", false, None)
+    let up = upload_file(&client, &ep, &src, "@scratch/big.bin", false)
         .await
         .unwrap();
     assert_eq!(up.size, 256 << 20);
 
     let dest = local.path().join("big-back.bin");
-    let down = download_file(&client, &ep, "@scratch/big.bin", &dest, false, None)
+    let down = download_file(&client, &ep, "@scratch/big.bin", &dest, false)
         .await
         .unwrap();
     assert_eq!(down.sha256, up.sha256);
