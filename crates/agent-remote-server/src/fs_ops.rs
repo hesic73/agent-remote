@@ -1,18 +1,20 @@
 use std::path::Path;
 
 use agent_remote_protocol::{
-    ErrorCode, FileEntry, ListEntry, ListKind, OperationKind, ProtocolError, ReadResult,
-    ResultBody, WriteOrPatchResult,
+    ErrorCode, FileEntry, ListEntry, ListKind, MutationResult, OperationKind, ProtocolError,
+    ReadResult, ResultBody,
 };
 use tokio::sync::MutexGuard;
 
 use crate::hash::hash_file;
-use crate::patch::apply_patch;
 use crate::store::OperationStore;
 use crate::workspace::Workspace;
 
 pub const LIST_DEFAULT_LIMIT: usize = 1000;
 pub const LIST_MAX_LIMIT: usize = 1000;
+/// Upper bound on create/edit text inputs, on the file being edited, and on
+/// the resulting file. Larger or binary files go through upload_file.
+pub const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn list(
     ws: &Workspace,
@@ -233,80 +235,192 @@ fn atomic_write_bytes(
     Ok((old_hash, new_hash))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn write(
+/// Atomically install a NEW file at abs without ever replacing an existing
+/// one: temp file in the same directory, then hard_link into place (which
+/// fails with AlreadyExists instead of clobbering, even against a concurrent
+/// creator such as a command run in the workspace).
+fn atomic_create_bytes(abs: &Path, content: &[u8], client_path: &str) -> Result<(), ProtocolError> {
+    let parent = abs
+        .parent()
+        .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidRequest, "path has no parent"))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("mkdir failed: {e}")))?;
+    let tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
+        ProtocolError::new(ErrorCode::IoError, format!("temp file create failed: {e}"))
+    })?;
+    std::fs::write(tmp.path(), content)
+        .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("temp write failed: {e}")))?;
+    // Temp files are 0600; a fresh workspace file should get conventional
+    // permissions instead of inheriting that.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644)).map_err(
+            |e| ProtocolError::new(ErrorCode::IoError, format!("chmod temp failed: {e}")),
+        )?;
+    }
+    std::fs::hard_link(tmp.path(), abs).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            ProtocolError::new(
+                ErrorCode::AlreadyExists,
+                format!("already exists: {client_path}; modify existing files with edit"),
+            )
+        } else {
+            ProtocolError::new(ErrorCode::IoError, format!("link into place failed: {e}"))
+        }
+    })?;
+    crate::fsync::fsync_file_or_dir(abs).map_err(|e| {
+        ProtocolError::new(
+            ErrorCode::IoError,
+            format!("fsync after create failed: {e}"),
+        )
+    })?;
+    Ok(())
+}
+
+/// Create a new text file. Refuses to touch an existing path: existing files
+/// are modified only through `edit`, so there is exactly one editing path.
+pub fn create(
     ws: &Workspace,
     store: &OperationStore,
     _guard: &MutexGuard<'_, ()>,
     request_id: &str,
     path: &str,
     content: &str,
-    base_hash: &Option<String>,
 ) -> Result<ResultBody, ProtocolError> {
+    if content.len() > MAX_TEXT_BYTES {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("content exceeds {MAX_TEXT_BYTES} bytes; use upload_file for large files"),
+        ));
+    }
     let abs = ws.resolve(path)?;
-    check_base_hash(&abs, base_hash)?;
-    let before_hash = hash_file(&abs)?;
-    let before_blob = std::fs::read(&abs).ok();
-    let expected_after_hash = crate::hash::hash_bytes(content.as_bytes());
-    // WAL step 1: durably record the prepared marker (with before blob) BEFORE
-    // touching the workspace, so a crash mid-mutation is recoverable on startup.
+    match std::fs::symlink_metadata(&abs) {
+        Ok(_) => {
+            return Err(ProtocolError::new(
+                ErrorCode::AlreadyExists,
+                format!("already exists: {path}; modify existing files with edit"),
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let new_hash = crate::hash::hash_bytes(content.as_bytes());
+    // WAL step 1: durably record the prepared marker BEFORE touching the
+    // workspace, so a crash mid-mutation is recoverable on startup.
     let op_id = store.prepare_fs_record(
         request_id,
-        OperationKind::Write,
+        OperationKind::Create,
         path,
-        before_hash.clone(),
-        expected_after_hash,
-        before_blob.as_deref(),
+        None,
+        new_hash.clone(),
+        None,
     )?;
-    // WAL step 2: perform the atomic rename.
-    let (old_hash, new_hash) = atomic_write_bytes(&abs, content.as_bytes())?;
-    // WAL step 3: commit the real hashes (before blob already on disk).
+    // WAL step 2: exclusive atomic install.
+    atomic_create_bytes(&abs, content.as_bytes(), path)?;
+    // WAL step 3: commit.
     store.commit_fs_record(
         &op_id,
         request_id,
-        OperationKind::Write,
+        OperationKind::Create,
         path,
-        old_hash.clone(),
+        None,
         new_hash.clone(),
     )?;
-    Ok(ResultBody::WriteOrPatch(WriteOrPatchResult {
+    Ok(ResultBody::Mutation(MutationResult {
         operation_id: op_id,
-        old_hash,
+        old_hash: None,
         new_hash,
     }))
 }
 
+/// Replace an exact occurrence of `old_text` with `new_text` in an existing
+/// UTF-8 file. The complete new content is built (and validated) before any
+/// mutation; installation reuses the atomic-rename path and preserves mode.
 #[allow(clippy::too_many_arguments)]
-pub fn patch(
+pub fn edit(
     ws: &Workspace,
     store: &OperationStore,
     _guard: &MutexGuard<'_, ()>,
     request_id: &str,
     path: &str,
     base_hash: &str,
-    patch_text: &str,
+    old_text: &str,
+    new_text: &str,
+    replace_all: bool,
 ) -> Result<ResultBody, ProtocolError> {
-    let abs = ws.resolve(path)?;
-    let current = check_base_hash(&abs, &Some(base_hash.to_string()))?;
-    if current.is_none() {
+    if old_text.is_empty() {
         return Err(ProtocolError::new(
-            ErrorCode::NotFound,
-            format!("not found: {path}"),
+            ErrorCode::InvalidRequest,
+            "old_text must not be empty",
         ));
     }
+    if old_text == new_text {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            "old_text and new_text are identical; nothing to change",
+        ));
+    }
+    if old_text.len() > MAX_TEXT_BYTES || new_text.len() > MAX_TEXT_BYTES {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("old_text/new_text exceed {MAX_TEXT_BYTES} bytes"),
+        ));
+    }
+    let abs = ws.resolve(path)?;
+    if !abs.exists() {
+        return Err(ProtocolError::new(
+            ErrorCode::NotFound,
+            format!("not found: {path}; new files are created with create, not edit"),
+        ));
+    }
+    let current = check_base_hash(&abs, &Some(base_hash.to_string()))?;
     let original = std::fs::read(&abs)
         .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("read failed: {e}")))?;
+    if original.len() > MAX_TEXT_BYTES {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("file exceeds {MAX_TEXT_BYTES} bytes; edit does not support files this large"),
+        ));
+    }
     let original_str = String::from_utf8(original.clone()).map_err(|_| {
         ProtocolError::new(
             ErrorCode::InvalidRequest,
-            "patch target is not valid UTF-8; patching binary files is unsupported",
+            "file is not valid UTF-8; editing binary files is unsupported",
         )
     })?;
-    let new_content = apply_patch(&original_str, patch_text)?;
+    let matches = original_str.matches(old_text).count();
+    if matches == 0 {
+        return Err(ProtocolError::new(
+            ErrorCode::NoMatch,
+            format!(
+                "old_text not found in {path}; re-read the file and copy the current text exactly"
+            ),
+        ));
+    }
+    if matches > 1 && !replace_all {
+        return Err(ProtocolError::new(
+            ErrorCode::AmbiguousMatch,
+            format!(
+                "old_text occurs {matches} times in {path}; extend it with surrounding context \
+                 to make it unique, or pass replace_all=true"
+            ),
+        ));
+    }
+    let new_content = if replace_all {
+        original_str.replace(old_text, new_text)
+    } else {
+        original_str.replacen(old_text, new_text, 1)
+    };
+    if new_content.len() > MAX_TEXT_BYTES {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            format!("resulting file would exceed {MAX_TEXT_BYTES} bytes"),
+        ));
+    }
     let new_hash = crate::hash::hash_bytes(new_content.as_bytes());
     let op_id = store.prepare_fs_record(
         request_id,
-        OperationKind::Patch,
+        OperationKind::Edit,
         path,
         current.clone(),
         new_hash.clone(),
@@ -317,12 +431,12 @@ pub fn patch(
     store.commit_fs_record(
         &op_id,
         request_id,
-        OperationKind::Patch,
+        OperationKind::Edit,
         path,
         old_hash.clone(),
         new_hash.clone(),
     )?;
-    Ok(ResultBody::WriteOrPatch(WriteOrPatchResult {
+    Ok(ResultBody::Mutation(MutationResult {
         operation_id: op_id,
         old_hash,
         new_hash,
@@ -377,7 +491,7 @@ pub fn delete(
         before_hash.clone(),
         "sha256:".into(),
     )?;
-    Ok(ResultBody::WriteOrPatch(WriteOrPatchResult {
+    Ok(ResultBody::Mutation(MutationResult {
         operation_id: op_id,
         old_hash: before_hash,
         new_hash: "sha256:".into(),

@@ -32,16 +32,22 @@ pub enum RequestBody {
         #[serde(default)]
         limit: Option<u64>,
     },
-    Write {
+    /// Create a new text file. Fails if the target already exists; existing
+    /// files are modified only through `Edit`.
+    Create {
         path: String,
         content: String,
-        #[serde(default)]
-        base_hash: Option<String>,
     },
-    Patch {
+    /// Replace an exact occurrence of `old_text` with `new_text` in an
+    /// existing text file. Zero matches fail with NO_MATCH; multiple matches
+    /// fail with AMBIGUOUS_MATCH unless `replace_all` is set.
+    Edit {
         path: String,
         base_hash: String,
-        patch: String,
+        old_text: String,
+        new_text: String,
+        #[serde(default)]
+        replace_all: bool,
     },
     Exec {
         argv: Vec<String>,
@@ -130,8 +136,11 @@ pub enum ResultBody {
     Stat { stat: FileEntry },
     #[serde(rename = "read")]
     Read(ReadResult),
+    /// Result of any single-file mutation (create, edit, delete). The wire tag
+    /// stays "write" so request logs recorded before the create/edit protocol
+    /// still deserialize.
     #[serde(rename = "write")]
-    WriteOrPatch(WriteOrPatchResult),
+    Mutation(MutationResult),
     #[serde(rename = "exec")]
     Exec(ExecResult),
     #[serde(rename = "undo")]
@@ -206,7 +215,7 @@ pub struct ReadResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WriteOrPatchResult {
+pub struct MutationResult {
     pub operation_id: OperationId,
     pub old_hash: Option<String>,
     pub new_hash: String,
@@ -217,6 +226,11 @@ pub struct ExecResult {
     pub operation_id: OperationId,
     pub termination: ExecTermination,
     pub duration_ms: u64,
+    /// True when output collection stopped before the pipes reached EOF: a
+    /// descendant still held stdout/stderr at the drain deadline and the
+    /// process group was killed. Output may be missing trailing bytes.
+    #[serde(default)]
+    pub drain_timed_out: bool,
     pub stdout: ExecOutput,
     pub stderr: ExecOutput,
 }
@@ -267,6 +281,9 @@ pub struct GcResult {
     pub removed_operations: usize,
     pub removed_requests: usize,
     pub retained_operations: usize,
+    /// Stale upload staging files (interrupted uploads) deleted by this gc.
+    #[serde(default)]
+    pub removed_stale_staging: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

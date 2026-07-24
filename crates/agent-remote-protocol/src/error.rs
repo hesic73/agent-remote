@@ -18,7 +18,12 @@ pub enum ErrorCode {
     UndoConflict,
     OperationNotFound,
     RequestNotFound,
+    /// Legacy code from the removed line-based patch operation. No longer
+    /// produced, kept so request logs written by older servers deserialize.
     PatchFailed,
+    AlreadyExists,
+    NoMatch,
+    AmbiguousMatch,
 }
 
 #[derive(Debug, Error, Clone, Serialize, Deserialize)]

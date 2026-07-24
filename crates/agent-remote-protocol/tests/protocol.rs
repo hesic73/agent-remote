@@ -42,21 +42,55 @@ fn read_round_trips() {
 }
 
 #[test]
-fn patch_round_trips() {
+fn create_round_trips() {
     let req = Request {
         request_id: "r3".into(),
-        body: RequestBody::Patch {
-            path: "src/main.py".into(),
-            base_hash: "sha256:abc123".into(),
-            patch: "...".into(),
+        body: RequestBody::Create {
+            path: "src/new.py".into(),
+            content: "print()\n".into(),
         },
     };
     let line = serde_json::to_string(&req).unwrap();
     assert_eq!(
         line,
-        r#"{"request_id":"r3","op":"patch","path":"src/main.py","base_hash":"sha256:abc123","patch":"..."}"#
+        r#"{"request_id":"r3","op":"create","path":"src/new.py","content":"print()\n"}"#
     );
     round_trip(&req);
+}
+
+#[test]
+fn edit_round_trips() {
+    let req = Request {
+        request_id: "r3".into(),
+        body: RequestBody::Edit {
+            path: "src/main.py".into(),
+            base_hash: "sha256:abc123".into(),
+            old_text: "old".into(),
+            new_text: "new".into(),
+            replace_all: false,
+        },
+    };
+    let line = serde_json::to_string(&req).unwrap();
+    assert_eq!(
+        line,
+        r#"{"request_id":"r3","op":"edit","path":"src/main.py","base_hash":"sha256:abc123","old_text":"old","new_text":"new","replace_all":false}"#
+    );
+    round_trip(&req);
+
+    // replace_all defaults to false when omitted on the wire.
+    let req: Request = serde_json::from_value(json!({
+        "request_id": "r",
+        "op": "edit",
+        "path": "p",
+        "base_hash": "sha256:a",
+        "old_text": "x",
+        "new_text": "y",
+    }))
+    .unwrap();
+    match req.body {
+        RequestBody::Edit { replace_all, .. } => assert!(!replace_all),
+        _ => panic!("wrong body"),
+    }
 }
 
 #[test]
@@ -137,6 +171,7 @@ fn exec_result_message() {
             operation_id: "op-43".into(),
             termination: ExecTermination::Exited { code: 0 },
             duration_ms: 12,
+            drain_timed_out: false,
             stdout: ExecOutput {
                 prefix: "collecting tests...\n".into(),
                 suffix: String::new(),
@@ -163,10 +198,10 @@ fn unknown_op_returns_invalid_request_on_deserialize() {
 }
 
 #[test]
-fn write_result_message_matches_design() {
+fn mutation_result_message_keeps_legacy_wire_tag() {
     let msg = ServerMessage::Result {
         request_id: "r3".into(),
-        result: ResultBody::WriteOrPatch(WriteOrPatchResult {
+        result: ResultBody::Mutation(MutationResult {
             operation_id: "op-42".into(),
             old_hash: Some("sha256:abc123".into()),
             new_hash: "sha256:def456".into(),
@@ -176,7 +211,33 @@ fn write_result_message_matches_design() {
     assert_eq!(v["operation_id"], "op-42");
     assert_eq!(v["old_hash"], "sha256:abc123");
     assert_eq!(v["new_hash"], "sha256:def456");
+    // Tag must stay "write" so request logs recorded before the create/edit
+    // protocol still deserialize.
     assert_eq!(v["type"], "write");
+}
+
+#[test]
+fn legacy_records_and_results_still_deserialize() {
+    // Operation logs written by pre-create/edit servers contain kinds "write"
+    // and "patch" and exec records without drain_timed_out.
+    let old_fs = r#"{"record_kind":"fs","operation_id":"op-1","request_id":"r","kind":"patch","after_hash":"sha256:z","path":"p","timestamp_ms":1}"#;
+    let rec: AnyOperationRecord = serde_json::from_str(old_fs).unwrap();
+    match rec {
+        AnyOperationRecord::Fs(f) => assert_eq!(f.kind, OperationKind::Patch),
+        _ => panic!("wrong record"),
+    }
+    let old_write = r#"{"record_kind":"fs","operation_id":"op-2","request_id":"r","kind":"write","after_hash":"sha256:z","path":"p","timestamp_ms":1}"#;
+    assert!(serde_json::from_str::<AnyOperationRecord>(old_write).is_ok());
+
+    let old_exec_result = r#"{"request_id":"r","type":"exec","operation_id":"op-3","termination":{"kind":"exited","code":0},"duration_ms":1,"stdout":{"prefix":"","suffix":"","total_bytes":0,"omitted_bytes":0},"stderr":{"prefix":"","suffix":"","total_bytes":0,"omitted_bytes":0}}"#;
+    let msg: ServerMessage = serde_json::from_str(old_exec_result).unwrap();
+    match msg {
+        ServerMessage::Result {
+            result: ResultBody::Exec(e),
+            ..
+        } => assert!(!e.drain_timed_out),
+        _ => panic!("wrong message"),
+    }
 }
 
 #[test]
@@ -243,7 +304,7 @@ fn every_result_variant_round_trips_through_server_message() {
             truncated: false,
             next_offset: None,
         }),
-        ResultBody::WriteOrPatch(WriteOrPatchResult {
+        ResultBody::Mutation(MutationResult {
             operation_id: "op-1".into(),
             old_hash: None,
             new_hash: "sha256:x".into(),
@@ -252,6 +313,7 @@ fn every_result_variant_round_trips_through_server_message() {
             operation_id: "op-2".into(),
             termination: ExecTermination::Exited { code: 0 },
             duration_ms: 1,
+            drain_timed_out: false,
             stdout: ExecOutput::default(),
             stderr: ExecOutput::default(),
         }),
@@ -266,7 +328,7 @@ fn every_result_variant_round_trips_through_server_message() {
                 agent_remote_protocol::FsOperationRecord {
                     operation_id: "op-4".into(),
                     request_id: "r".into(),
-                    kind: agent_remote_protocol::OperationKind::Write,
+                    kind: agent_remote_protocol::OperationKind::Create,
                     path: "p".into(),
                     before_hash: None,
                     after_hash: "sha256:z".into(),

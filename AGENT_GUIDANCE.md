@@ -1,19 +1,23 @@
 # Agent guidance
 
-This server manages one or more named workspaces, each a directory on a configured machine. Every tool except `list_workspaces` requires a `workspace` argument naming which one to act on; call `list_workspaces` to see the available names. Workspaces are fully isolated from each other: paths, operation IDs, history, undo, and request IDs are scoped to a single workspace and mean nothing in another. Transfers move files between the local machine and one workspace; to move data between two workspaces, download to a local file and upload it.
+This server manages one or more named workspaces, each a directory on a configured machine. Every tool except `list_workspaces` requires a `workspace` argument naming which one to act on. Workspaces are fully isolated from each other: paths, operation IDs, history, undo, and request IDs are scoped to a single workspace and mean nothing in another.
 
-Use the file tools for workspace reads and mutations. Use `run_command` for builds, tests, searches, and process management.
+The normal workflow:
 
-File reads and directory listings are bounded. Follow `next_offset` or the returned offset notice to retrieve another page instead of requesting unbounded output.
+1. Call `list_workspaces` when the workspace name is unknown.
+2. Inspect with `list_directory` and `read_file`; follow the returned offsets to page through large results.
+3. Use `create_file` only for new text files; it refuses existing paths.
+4. Use `edit_file` for every modification to an existing text file: pass the hash from `read_file` as `base_hash` and copy `old_text` exactly from the current content.
+5. Use `delete_file` for deletion.
+6. Use `run_command` for search (`rg`), file discovery (`find`), Git, builds, tests, and running programs.
+7. Use `upload_file`/`download_file` for large or binary files; their content never enters the model context. Never move binary data through `create_file`, base64, shell quoting, or paginated `read_file`.
+8. Use `undo` only for recorded file mutations (create/edit/delete), and only while the file is unchanged since.
+9. Never automatically retry `run_command` after an uncertain transport failure, because the command may already have produced side effects.
 
-Normal relative paths address the workspace. Paths beginning with `@scratch/` address the workspace's server-managed scratch area. Commands receive its physical path in `AGENT_REMOTE_SCRATCH`. Use scratch for logs and other runtime artifacts; server operation logs, request state, and undo blobs are private and are never exposed there.
+Normal relative paths address the workspace. Paths beginning with `@scratch/` address the workspace's server-managed scratch area; commands receive its physical path in `$AGENT_REMOTE_SCRATCH`. Use scratch for logs and other runtime artifacts.
 
-`run_command` is synchronous. Its result contains the termination reason, duration, and a bounded preview of each output stream: the first 4 KiB and last 12 KiB. Prefer targeted commands and filters. When full output is needed, redirect it to `$AGENT_REMOTE_SCRATCH`, then inspect the corresponding `@scratch/...` file incrementally with `read_file` using `offset` and `limit`.
+`run_command` is synchronous and owns its process tree. The result contains the termination reason, duration, and a bounded preview of each stream (first 4 KiB, last 12 KiB); redirect full output to `$AGENT_REMOTE_SCRATCH` and read the `@scratch/...` file incrementally. After the command exits, output collection waits briefly for the pipes to close, then kills leftover descendants and sets `drain_timed_out` in the result. For work that must outlive one call, use a remote-native supervisor such as tmux and write its logs to scratch; a successful launcher exit does not confirm the detached workload succeeded.
 
-Use `upload_file` and `download_file` to move large or binary files between the local machine and the remote workspace. They stream raw bytes; the file content never enters the model context. Keep using `read_file` for inspecting text. Never move binary data through `write_file`, base64, shell quoting, or paginated `read_file`. Each transfer handles exactly one regular file, the destination's parent directory must already exist, and an existing destination is only replaced with `overwrite=true`. Transfers are synchronous: a long-running call means bytes are still flowing, not that the tool is stuck. After a disconnected transfer, `stat` the destination before deciding whether to retry; the destination only exists once a transfer fully succeeded. To import a file from a URL, `run_command` a downloader (e.g. `curl -o`) on the remote side instead of transferring through the local machine.
-
-For work that must outlive one call, use a remote-native supervisor such as tmux and write its logs to scratch. A successful launcher command confirms only that the launcher exited successfully; it does not confirm that the detached workload completed successfully.
-
-Do not automatically retry `run_command` after an uncertain transport failure because the command may already have produced side effects.
+Transfers move exactly one regular file between the local machine and one workspace; the destination's parent directory must already exist, and an existing destination is only replaced with `overwrite=true`. They are synchronous: a long-running call means bytes are still flowing. After a disconnected transfer, check the destination (e.g. `list_directory` its parent) before deciding whether to retry. To import a file from a URL, run a downloader (`curl -o`) on the remote side via `run_command` instead of transferring through the local machine.
 
 File tools are confined to the workspace and scratch roots. Command execution is not a sandbox and can access anything permitted to the remote server user.

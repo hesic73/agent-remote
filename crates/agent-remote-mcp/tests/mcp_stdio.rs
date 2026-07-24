@@ -261,11 +261,10 @@ fn mcp_tools_list_has_expected_tools() {
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     let expected = [
         "list_workspaces",
-        "list_dir",
+        "list_directory",
         "read_file",
-        "stat",
-        "write_file",
-        "patch_file",
+        "create_file",
+        "edit_file",
         "delete_file",
         "run_command",
         "upload_file",
@@ -305,11 +304,11 @@ fn mcp_tool_call_success_is_not_error() {
     s.initialize();
 
     let (e, text) = s.tool(
-        "write_file",
+        "create_file",
         serde_json::json!({"workspace": "test", "path": "test.txt", "content": "hello\n"}),
     );
-    assert!(!e, "write should not be an error: {text}");
-    assert!(text.contains("Wrote test.txt"), "unexpected text: {text}");
+    assert!(!e, "create should not be an error: {text}");
+    assert!(text.contains("Created test.txt"), "unexpected text: {text}");
     assert!(
         text.contains("workspace 'test'"),
         "result must echo the workspace: {text}"
@@ -340,7 +339,7 @@ fn mcp_unknown_workspace_is_a_clear_error() {
     s.initialize();
 
     let (e, text) = s.tool(
-        "stat",
+        "list_directory",
         serde_json::json!({"workspace": "nope", "path": "."}),
     );
     assert!(e, "unknown workspace must be isError=true");
@@ -407,7 +406,7 @@ fn mcp_workspaces_are_isolated() {
     );
 
     let (e, _) = s.tool(
-        "write_file",
+        "create_file",
         serde_json::json!({"workspace": "a", "path": "only-in-a.txt", "content": "x"}),
     );
     assert!(!e);
@@ -431,8 +430,8 @@ fn mcp_workspaces_are_isolated() {
     assert!(text.contains("only-in-a.txt"), "a's history: {text}");
 }
 
-// Drive every remaining tool over real MCP stdio: stat, patch_file,
-// delete_file, undo, history, operation_get, request_status.
+// Drive every remaining tool over real MCP stdio: edit_file, delete_file,
+// undo, history, operation_get, request_status.
 #[test]
 fn mcp_full_tool_surface() {
     let dir = tempfile::tempdir().unwrap();
@@ -440,27 +439,48 @@ fn mcp_full_tool_surface() {
     s.initialize();
 
     let (e, _) = s.tool(
-        "write_file",
+        "create_file",
         serde_json::json!({"workspace": "test", "path": "f.txt", "content": "l1\nl2\n"}),
     );
     assert!(!e);
 
-    // stat returns the hash we need for patching, and echoes the workspace.
+    // Creating the same path again must be refused: existing files are only
+    // modified through edit_file.
     let (e, text) = s.tool(
-        "stat",
+        "create_file",
+        serde_json::json!({"workspace": "test", "path": "f.txt", "content": "other"}),
+    );
+    assert!(e, "re-creating an existing file must be isError=true");
+    assert!(text.contains("AlreadyExists"), "unexpected text: {text}");
+
+    // read_file returns the hash edit_file needs as base_hash.
+    let (e, text) = s.tool(
+        "read_file",
         serde_json::json!({"workspace": "test", "path": "f.txt"}),
     );
-    assert!(!e, "stat failed: {text}");
-    let stat: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(stat["workspace"], "test");
-    let hash = stat["hash"].as_str().unwrap().to_string();
+    assert!(!e, "read failed: {text}");
+    let hash = text
+        .split("[hash: ")
+        .nth(1)
+        .expect("read result must carry the hash")
+        .trim_end_matches(']')
+        .trim()
+        .to_string();
+
+    // A non-matching old_text is a structured NO_MATCH error.
+    let (e, text) = s.tool(
+        "edit_file",
+        serde_json::json!({"workspace": "test", "path": "f.txt", "base_hash": hash, "old_text": "nope", "new_text": "x"}),
+    );
+    assert!(e, "no-match edit must be isError=true");
+    assert!(text.contains("NoMatch"), "unexpected text: {text}");
 
     let (e, text) = s.tool(
-        "patch_file",
-        serde_json::json!({"workspace": "test", "path": "f.txt", "base_hash": hash, "patch": "2c L2"}),
+        "edit_file",
+        serde_json::json!({"workspace": "test", "path": "f.txt", "base_hash": hash, "old_text": "l2\n", "new_text": "L2\n"}),
     );
-    assert!(!e, "patch failed: {text}");
-    let patch_op = text
+    assert!(!e, "edit failed: {text}");
+    let edit_op = text
         .split("operation_id=")
         .nth(1)
         .unwrap()
@@ -474,12 +494,12 @@ fn mcp_full_tool_surface() {
         serde_json::json!({"workspace": "test", "path": "f.txt"}),
     );
     assert!(!e);
-    assert!(text.starts_with("l1\nL2\n"), "patch not applied: {text}");
+    assert!(text.starts_with("l1\nL2\n"), "edit not applied: {text}");
 
-    // Undo the patch.
+    // Undo the edit.
     let (e, text) = s.tool(
         "undo",
-        serde_json::json!({"workspace": "test", "operation_id": patch_op}),
+        serde_json::json!({"workspace": "test", "operation_id": edit_op}),
     );
     assert!(!e, "undo failed: {text}");
     let (_, text) = s.tool(
@@ -501,7 +521,7 @@ fn mcp_full_tool_surface() {
     );
     assert!(e, "reading a deleted file must be an error");
 
-    // History shows all four operations; operation_get resolves the patch op.
+    // History shows the operations; operation_get resolves the edit op.
     let (e, text) = s.tool("history", serde_json::json!({"workspace": "test"}));
     assert!(!e);
     assert!(
@@ -510,10 +530,10 @@ fn mcp_full_tool_surface() {
     );
     let (e, text) = s.tool(
         "operation_get",
-        serde_json::json!({"workspace": "test", "operation_id": patch_op}),
+        serde_json::json!({"workspace": "test", "operation_id": edit_op}),
     );
     assert!(!e, "operation_get failed: {text}");
-    assert!(text.contains(&patch_op));
+    assert!(text.contains(&edit_op));
 
     // request_status on an unknown id reports unknown, not an error.
     let (e, text) = s.tool(
@@ -535,7 +555,7 @@ fn mcp_reconnects_after_server_death() {
     s.initialize();
 
     let (e, _) = s.tool(
-        "list_dir",
+        "list_directory",
         serde_json::json!({"workspace": "test", "path": "."}),
     );
     assert!(!e, "first call must succeed");
@@ -551,7 +571,7 @@ fn mcp_reconnects_after_server_death() {
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     let (e, text) = s.tool(
-        "list_dir",
+        "list_directory",
         serde_json::json!({"workspace": "test", "path": "."}),
     );
     assert!(!e, "call after server death must reconnect, got: {text}");
@@ -566,7 +586,7 @@ fn mcp_transfer_tools_roundtrip_and_errors() {
     let mut s = McpSession::spawn(remote.path().to_str().unwrap());
     s.initialize();
 
-    // Binary content that read_file/write_file could not carry.
+    // Binary content that read_file/create_file could not carry.
     let content: Vec<u8> = vec![0x00, 0xFF, 0xFE, 0x00, 0x42];
     let src = local.path().join("payload.bin");
     std::fs::write(&src, &content).unwrap();

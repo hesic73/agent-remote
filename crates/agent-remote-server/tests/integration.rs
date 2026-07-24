@@ -190,20 +190,19 @@ fn req(id: &str, body: RequestBody) -> Request {
 }
 
 #[tokio::test]
-async fn write_then_read_roundtrip() {
+async fn create_then_read_roundtrip() {
     let mut h = harness().await;
     h.send(&req(
         "r1",
-        RequestBody::Write {
+        RequestBody::Create {
             path: "hello.txt".into(),
             content: "hello world\n".into(),
-            base_hash: None,
         },
     ));
     let m = h.recv().await;
     match m {
         ServerMessage::Result {
-            result: ResultBody::WriteOrPatch(w),
+            result: ResultBody::Mutation(w),
             ..
         } => {
             assert_eq!(w.old_hash, None);
@@ -240,10 +239,9 @@ async fn list_and_stat() {
     let mut h = harness().await;
     h.send(&req(
         "w",
-        RequestBody::Write {
+        RequestBody::Create {
             path: "a.txt".into(),
             content: "aaa".into(),
-            base_hash: None,
         },
     ));
     let _ = h.recv().await;
@@ -341,38 +339,41 @@ async fn stale_hash_rejected() {
     let mut h = harness().await;
     h.send(&req(
         "w1",
-        RequestBody::Write {
+        RequestBody::Create {
             path: "f.txt".into(),
             content: "v1".into(),
-            base_hash: None,
         },
     ));
     let hash = match h.recv().await {
         ServerMessage::Result {
-            result: ResultBody::WriteOrPatch(w),
+            result: ResultBody::Mutation(w),
             ..
         } => w.new_hash,
         other => panic!("unexpected: {other:?}"),
     };
 
-    // Write with correct base_hash should succeed.
+    // Edit with correct base_hash should succeed.
     h.send(&req(
         "w2",
-        RequestBody::Write {
+        RequestBody::Edit {
             path: "f.txt".into(),
-            content: "v2".into(),
-            base_hash: Some(hash.clone()),
+            base_hash: hash.clone(),
+            old_text: "v1".into(),
+            new_text: "v2".into(),
+            replace_all: false,
         },
     ));
     let _ = h.recv().await;
 
-    // Now write with stale base_hash should be rejected.
+    // Now edit with the stale v1 base_hash should be rejected.
     h.send(&req(
         "w3",
-        RequestBody::Write {
+        RequestBody::Edit {
             path: "f.txt".into(),
-            content: "v3".into(),
-            base_hash: Some(hash),
+            base_hash: hash,
+            old_text: "v2".into(),
+            new_text: "v3".into(),
+            replace_all: false,
         },
     ));
     let m = h.recv().await;
@@ -401,31 +402,32 @@ async fn stale_hash_rejected() {
 }
 
 #[tokio::test]
-async fn patch_atomic_all_or_nothing() {
+async fn edit_atomic_all_or_nothing() {
     let mut h = harness().await;
     h.send(&req(
         "w",
-        RequestBody::Write {
+        RequestBody::Create {
             path: "p.txt".into(),
             content: "a\nb\nc\n".into(),
-            base_hash: None,
         },
     ));
     let hash = match h.recv().await {
         ServerMessage::Result {
-            result: ResultBody::WriteOrPatch(w),
+            result: ResultBody::Mutation(w),
             ..
         } => w.new_hash,
         other => panic!("unexpected: {other:?}"),
     };
 
-    // Valid patch.
+    // Valid edit.
     h.send(&req(
         "pa",
-        RequestBody::Patch {
+        RequestBody::Edit {
             path: "p.txt".into(),
             base_hash: hash.clone(),
-            patch: "2c BEE".into(),
+            old_text: "b".into(),
+            new_text: "BEE".into(),
+            replace_all: false,
         },
     ));
     let _ = h.recv().await;
@@ -434,15 +436,17 @@ async fn patch_atomic_all_or_nothing() {
         "a\nBEE\nc\n"
     );
 
-    // Invalid patch: file must remain unchanged.
+    // Failing edit (old_text absent): file must remain unchanged.
     let before = std::fs::read_to_string(h.root_path.join("p.txt")).unwrap();
     let current_hash = hash_of(&before);
     h.send(&req(
         "pb",
-        RequestBody::Patch {
+        RequestBody::Edit {
             path: "p.txt".into(),
             base_hash: current_hash,
-            patch: "99d".into(), // out of range
+            old_text: "not-present".into(),
+            new_text: "X".into(),
+            replace_all: false,
         },
     ));
     let m = h.recv().await;
@@ -450,14 +454,23 @@ async fn patch_atomic_all_or_nothing() {
         m,
         ServerMessage::Error {
             error: ProtocolError {
-                code: ErrorCode::PatchFailed,
+                code: ErrorCode::NoMatch,
                 ..
             },
             ..
         }
     ));
     let after = std::fs::read_to_string(h.root_path.join("p.txt")).unwrap();
-    assert_eq!(before, after, "patch failure must not mutate file");
+    assert_eq!(before, after, "edit failure must not mutate file");
+    // And the failed edit must not have been recorded: only create + valid edit.
+    h.send(&req("hist", RequestBody::History { limit: None }));
+    match h.recv().await {
+        ServerMessage::Result {
+            result: ResultBody::History { operations },
+            ..
+        } => assert_eq!(operations.len(), 2, "failed edit must not be recorded"),
+        other => panic!("unexpected: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -649,24 +662,25 @@ async fn undo_restores_previous_content() {
     let mut h = harness().await;
     h.send(&req(
         "w1",
-        RequestBody::Write {
+        RequestBody::Create {
             path: "u.txt".into(),
             content: "original\n".into(),
-            base_hash: None,
         },
     ));
     let _ = h.recv().await;
     h.send(&req(
         "w2",
-        RequestBody::Write {
+        RequestBody::Edit {
             path: "u.txt".into(),
-            content: "modified\n".into(),
-            base_hash: Some(hash_of("original\n")),
+            base_hash: hash_of("original\n"),
+            old_text: "original".into(),
+            new_text: "modified".into(),
+            replace_all: false,
         },
     ));
     let op_id = match h.recv().await {
         ServerMessage::Result {
-            result: ResultBody::WriteOrPatch(w),
+            result: ResultBody::Mutation(w),
             ..
         } => w.operation_id,
         other => panic!("unexpected: {other:?}"),
@@ -708,24 +722,25 @@ async fn undo_conflict_when_file_changed() {
     let mut h = harness().await;
     h.send(&req(
         "w1",
-        RequestBody::Write {
+        RequestBody::Create {
             path: "c.txt".into(),
             content: "v1\n".into(),
-            base_hash: None,
         },
     ));
     let _ = h.recv().await;
     h.send(&req(
         "w2",
-        RequestBody::Write {
+        RequestBody::Edit {
             path: "c.txt".into(),
-            content: "v2\n".into(),
-            base_hash: Some(hash_of("v1\n")),
+            base_hash: hash_of("v1\n"),
+            old_text: "v1".into(),
+            new_text: "v2".into(),
+            replace_all: false,
         },
     ));
     let op_id = match h.recv().await {
         ServerMessage::Result {
-            result: ResultBody::WriteOrPatch(w),
+            result: ResultBody::Mutation(w),
             ..
         } => w.operation_id,
         other => panic!("unexpected: {other:?}"),
@@ -761,10 +776,9 @@ async fn undo_conflict_when_file_changed() {
 #[tokio::test]
 async fn idempotent_replay_returns_same_result() {
     let mut h = harness().await;
-    let body = RequestBody::Write {
+    let body = RequestBody::Create {
         path: "idem.txt".into(),
         content: "x".into(),
-        base_hash: None,
     };
     h.send(&req("dup", body.clone()));
     let m1 = h.recv().await;
@@ -803,10 +817,9 @@ async fn request_status_unknown_and_done() {
     // Execute a request, then query its status.
     h.send(&req(
         "real",
-        RequestBody::Write {
+        RequestBody::Create {
             path: "q.txt".into(),
             content: "q".into(),
-            base_hash: None,
         },
     ));
     let _ = h.recv().await;
@@ -834,30 +847,31 @@ async fn history_and_operation_get() {
     let mut h = harness().await;
     h.send(&req(
         "w1",
-        RequestBody::Write {
+        RequestBody::Create {
             path: "h.txt".into(),
             content: "1".into(),
-            base_hash: None,
         },
     ));
     let op1 = match h.recv().await {
         ServerMessage::Result {
-            result: ResultBody::WriteOrPatch(w),
+            result: ResultBody::Mutation(w),
             ..
         } => w.operation_id,
         other => panic!("unexpected: {other:?}"),
     };
     h.send(&req(
         "w2",
-        RequestBody::Write {
+        RequestBody::Edit {
             path: "h.txt".into(),
-            content: "2".into(),
-            base_hash: Some(hash_of("1")),
+            base_hash: hash_of("1"),
+            old_text: "1".into(),
+            new_text: "2".into(),
+            replace_all: false,
         },
     ));
     let op2 = match h.recv().await {
         ServerMessage::Result {
-            result: ResultBody::WriteOrPatch(w),
+            result: ResultBody::Mutation(w),
             ..
         } => w.operation_id,
         other => panic!("unexpected: {other:?}"),
@@ -891,7 +905,7 @@ async fn history_and_operation_get() {
         } => match record {
             AnyOperationRecord::Fs(fs) => {
                 assert_eq!(fs.operation_id, op2);
-                assert_eq!(fs.kind, OperationKind::Write);
+                assert_eq!(fs.kind, OperationKind::Edit);
             }
             other => panic!("expected fs record, got {other:?}"),
         },
@@ -962,10 +976,9 @@ async fn symlinked_ancestor_nonexistent_leaf_blocked() {
 
     h.send(&req(
         "w",
-        RequestBody::Write {
+        RequestBody::Create {
             path: "escape/new.txt".into(),
             content: "PWNED".into(),
-            base_hash: None,
         },
     ));
     let m = h.recv().await;
@@ -998,10 +1011,9 @@ async fn replay_after_restart_returns_stored_result() {
         let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
         h.send(&req(
             "stable",
-            RequestBody::Write {
+            RequestBody::Create {
                 path: "f.txt".into(),
                 content: "v1".into(),
-                base_hash: None,
             },
         ));
         let _ = h.recv().await;
@@ -1015,19 +1027,18 @@ async fn replay_after_restart_returns_stored_result() {
         let mut h = harness_at_with(root.path(), log_dir, None).await;
         h.send(&req(
             "stable",
-            RequestBody::Write {
+            RequestBody::Create {
                 path: "f.txt".into(),
                 content: "v2".into(), // different content; must be ignored
-                base_hash: None,
             },
         ));
         let m = h.recv().await;
         match m {
             ServerMessage::Result {
-                result: ResultBody::WriteOrPatch(w),
+                result: ResultBody::Mutation(w),
                 ..
             } => {
-                // The replayed result must reflect the ORIGINAL write (v1), and
+                // The replayed result must reflect the ORIGINAL create (v1), and
                 // no new operation id should have been allocated.
                 assert_eq!(w.new_hash, hash_of("v1"));
             }
@@ -1069,10 +1080,9 @@ async fn request_status_survives_restart() {
         let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
         h.send(&req(
             "real",
-            RequestBody::Write {
+            RequestBody::Create {
                 path: "q.txt".into(),
                 content: "q".into(),
-                base_hash: None,
             },
         ));
         let _ = h.recv().await;
@@ -1105,12 +1115,11 @@ async fn request_status_survives_restart() {
 async fn concurrent_duplicate_request_runs_once() {
     let mut h = harness().await;
     // Fire two requests with the SAME id back to back, before the first
-    // resolves. A write is fast, but sending both first guarantees they are
+    // resolves. A create is fast, but sending both first guarantees they are
     // both in flight.
-    let body = RequestBody::Write {
+    let body = RequestBody::Create {
         path: "dup.txt".into(),
         content: "x".into(),
-        base_hash: None,
     };
     h.send(&req("same", body.clone()));
     h.send(&req("same", body));
@@ -1144,15 +1153,14 @@ async fn undo_file_creation_removes_file() {
     let mut h = harness().await;
     h.send(&req(
         "create",
-        RequestBody::Write {
+        RequestBody::Create {
             path: "new.txt".into(),
             content: "fresh\n".into(),
-            base_hash: None,
         },
     ));
     let op_id = match h.recv().await {
         ServerMessage::Result {
-            result: ResultBody::WriteOrPatch(w),
+            result: ResultBody::Mutation(w),
             ..
         } => w.operation_id,
         other => panic!("unexpected: {other:?}"),
@@ -1293,9 +1301,9 @@ async fn rejected_exec_recorded_with_disposition() {
     }
 }
 
-// F7: write preserves executable permissions.
+// F7: edit of an existing file preserves executable permissions.
 #[tokio::test]
-async fn write_preserves_executable_bit() {
+async fn edit_preserves_executable_bit() {
     use std::os::unix::fs::PermissionsExt;
     let mut h = harness().await;
     // Create an executable script directly.
@@ -1312,13 +1320,19 @@ async fn write_preserves_executable_bit() {
 
     h.send(&req(
         "w",
-        RequestBody::Write {
+        RequestBody::Edit {
             path: "run.sh".into(),
-            content: "#!/bin/sh\necho bye\n".into(),
-            base_hash: None,
+            base_hash: hash_of("#!/bin/sh\necho hi\n"),
+            old_text: "echo hi".into(),
+            new_text: "echo bye".into(),
+            replace_all: false,
         },
     ));
-    let _ = h.recv().await;
+    let m = h.recv().await;
+    assert!(
+        matches!(m, ServerMessage::Result { .. }),
+        "edit must succeed: {m:?}"
+    );
 
     let after = std::fs::metadata(h.root_path.join("run.sh"))
         .unwrap()
@@ -1338,10 +1352,9 @@ async fn read_hash_consistent_with_base_hash() {
     let mut h = harness().await;
     h.send(&req(
         "w",
-        RequestBody::Write {
+        RequestBody::Create {
             path: "c.txt".into(),
             content: "alpha\n".into(),
-            base_hash: None,
         },
     ));
     let _ = h.recv().await;
@@ -1362,14 +1375,16 @@ async fn read_hash_consistent_with_base_hash() {
         other => panic!("unexpected: {other:?}"),
     };
 
-    // Using the read-returned hash as base_hash for a write must succeed
+    // Using the read-returned hash as base_hash for an edit must succeed
     // (i.e. read and mutation agree on the hash).
     h.send(&req(
         "w2",
-        RequestBody::Write {
+        RequestBody::Edit {
             path: "c.txt".into(),
-            content: "beta\n".into(),
-            base_hash: Some(hash),
+            base_hash: hash,
+            old_text: "alpha".into(),
+            new_text: "beta".into(),
+            replace_all: false,
         },
     ));
     let m = h.recv().await;
@@ -1413,10 +1428,9 @@ async fn binary_safe_hash_for_multibyte_utf8() {
     let content = "héllo, 世界 🦀\n";
     h.send(&req(
         "w",
-        RequestBody::Write {
+        RequestBody::Create {
             path: "u.txt".into(),
             content: content.into(),
-            base_hash: None,
         },
     ));
     let _ = h.recv().await;
@@ -1470,7 +1484,7 @@ async fn recovery_synthesizes_commit_when_rename_done() {
         "record_kind": "prepared",
         "operation_id": "op-7",
         "request_id": "crashed-req",
-        "kind": "write",
+        "kind": "edit",
         "path": "f.txt",
         "before_hash": before_hash,
         "expected_after_hash": after_hash,
@@ -1481,7 +1495,7 @@ async fn recovery_synthesizes_commit_when_rename_done() {
     let in_progress = serde_json::json!({
         "request_id": "crashed-req",
         "status": "inprogress",
-        "op": "write",
+        "op": "edit",
     });
     std::fs::write(&req_path, format!("{in_progress}\n")).unwrap();
 
@@ -1513,16 +1527,18 @@ async fn recovery_synthesizes_commit_when_rename_done() {
     // with the synthesized result.
     h.send(&req(
         "crashed-req",
-        RequestBody::Write {
+        RequestBody::Edit {
             path: "f.txt".into(),
-            content: "DIFFERENT".into(),
-            base_hash: None,
+            base_hash: after_hash.clone(),
+            old_text: "new".into(),
+            new_text: "DIFFERENT".into(),
+            replace_all: false,
         },
     ));
     let m = h.recv().await;
     match m {
         ServerMessage::Result {
-            result: ResultBody::WriteOrPatch(w),
+            result: ResultBody::Mutation(w),
             ..
         } => {
             assert_eq!(w.operation_id, "op-7");
@@ -1577,7 +1593,7 @@ async fn recovery_drops_when_rename_not_done() {
         "record_kind": "prepared",
         "operation_id": "op-7",
         "request_id": "crashed-req",
-        "kind": "write",
+        "kind": "edit",
         "path": "f.txt",
         "before_hash": before_hash,
         "expected_after_hash": after_hash,
@@ -1588,7 +1604,7 @@ async fn recovery_drops_when_rename_not_done() {
         &req_path,
         format!(
             "{}\n",
-            serde_json::json!({"request_id": "crashed-req", "status": "inprogress", "op": "write"})
+            serde_json::json!({"request_id": "crashed-req", "status": "inprogress", "op": "edit"})
         ),
     )
     .unwrap();
@@ -1610,19 +1626,21 @@ async fn recovery_drops_when_rename_not_done() {
     }
 
     // The stuck request must now be retryable (status Unknown), so replaying it
-    // executes the write for real.
+    // executes the edit for real.
     h.send(&req(
         "crashed-req",
-        RequestBody::Write {
+        RequestBody::Edit {
             path: "f.txt".into(),
-            content: after.to_string(),
-            base_hash: None,
+            base_hash: before_hash.clone(),
+            old_text: "old".into(),
+            new_text: "new".into(),
+            replace_all: false,
         },
     ));
     let m = h.recv().await;
     match m {
         ServerMessage::Result {
-            result: ResultBody::WriteOrPatch(w),
+            result: ResultBody::Mutation(w),
             ..
         } => {
             assert_eq!(w.new_hash, after_hash);
@@ -1651,10 +1669,9 @@ async fn read_only_request_log_surfaces_error() {
     let mut h = harness_at_with(root.path(), log_dir, None).await;
     h.send(&req(
         "r1",
-        RequestBody::Write {
+        RequestBody::Create {
             path: "f.txt".into(),
             content: "x".into(),
-            base_hash: None,
         },
     ));
     let m = h.recv().await;
@@ -1674,18 +1691,17 @@ async fn read_only_request_log_surfaces_error() {
     .ok();
 }
 
-// F4: a normal write durably appends BOTH a prepared marker and a committed
+// F4: a normal create durably appends BOTH a prepared marker and a committed
 // fs record (the WAL), and history reconciles them to a single entry.
 #[tokio::test]
-async fn write_appends_prepared_then_committed() {
+async fn create_appends_prepared_then_committed() {
     let root = tempfile::tempdir().unwrap();
     let mut h = harness_at(root.path()).await;
     h.send(&req(
         "w",
-        RequestBody::Write {
+        RequestBody::Create {
             path: "f.txt".into(),
             content: "hi".into(),
-            base_hash: None,
         },
     ));
     let _ = h.recv().await;
@@ -1732,7 +1748,7 @@ async fn aborted_marker_prevents_zombie_prepared() {
         "record_kind": "prepared",
         "operation_id": "op-7",
         "request_id": "zombie-req",
-        "kind": "write",
+        "kind": "edit",
         "path": "f.txt",
         "before_hash": before_hash,
         "expected_after_hash": after_hash,
@@ -1743,7 +1759,7 @@ async fn aborted_marker_prevents_zombie_prepared() {
         log_dir.join("requests.jsonl"),
         format!(
             "{}\n",
-            serde_json::json!({"request_id":"zombie-req","status":"inprogress","op":"write"})
+            serde_json::json!({"request_id":"zombie-req","status":"inprogress","op":"edit"})
         ),
     )
     .unwrap();
@@ -1754,10 +1770,12 @@ async fn aborted_marker_prevents_zombie_prepared() {
         // Retry with a NEW request id so we don't replay cleanup.
         h.send(&req(
             "new-req",
-            RequestBody::Write {
+            RequestBody::Edit {
                 path: "f.txt".into(),
-                content: "after".into(),
-                base_hash: Some(before_hash),
+                base_hash: before_hash,
+                old_text: "before".into(),
+                new_text: "after".into(),
+                replace_all: false,
             },
         ));
         let _ = h.recv().await;
@@ -1886,16 +1904,16 @@ async fn undo_crash_window_recovers() {
     let before_hash = hash_of(before);
     let after_hash = hash_of(after);
 
-    // Pretend a write op-1 created "before", then a write op-2 changed it to
+    // Pretend a create op-1 made "before", then an edit op-2 changed it to
     // "after". We'll simulate an undo of op-2 (restore "before") that crashed.
     std::fs::write(root.path().join("f.txt"), before).unwrap();
-    // Write op-2: recorded as Fs with before_hash=before_hash, after_hash=after_hash.
-    // Write op-2 committed.
+    // Edit op-2: recorded as Fs with before_hash=before_hash, after_hash=after_hash.
+    // Edit op-2 committed.
     let op2 = serde_json::json!({
         "record_kind": "fs",
         "operation_id": "op-2",
         "request_id": "w2-req",
-        "kind": "write",
+        "kind": "edit",
         "path": "f.txt",
         "before_hash": before_hash,
         "after_hash": after_hash,
@@ -1984,7 +2002,7 @@ async fn recovery_reconstructs_result_from_committed_record() {
 
     let after_hash = hash_of("after");
 
-    // Simulate: a write ran to completion (prepared → rename → committed),
+    // Simulate: a create ran to completion (prepared → rename → committed),
     // but the terminal result was never written to requests.jsonl.
     // File is already "after".
     std::fs::write(root.path().join("f.txt"), "after").unwrap();
@@ -1993,7 +2011,7 @@ async fn recovery_reconstructs_result_from_committed_record() {
         "record_kind": "fs",
         "operation_id": "op-7",
         "request_id": "committed-no-result",
-        "kind": "write",
+        "kind": "create",
         "path": "f.txt",
         "before_hash": null,
         "after_hash": after_hash,
@@ -2009,7 +2027,7 @@ async fn recovery_reconstructs_result_from_committed_record() {
             serde_json::json!({
                 "request_id": "committed-no-result",
                 "status": "inprogress",
-                "op": "write",
+                "op": "create",
             })
         ),
     )
@@ -2023,16 +2041,15 @@ async fn recovery_reconstructs_result_from_committed_record() {
     // result, NOT re-execute.
     h.send(&req(
         "committed-no-result",
-        RequestBody::Write {
+        RequestBody::Create {
             path: "f.txt".into(),
             content: "should-not-run".into(),
-            base_hash: None,
         },
     ));
     let m = h.recv().await;
     match m {
         ServerMessage::Result {
-            result: ResultBody::WriteOrPatch(w),
+            result: ResultBody::Mutation(w),
             ..
         } => {
             assert_eq!(w.operation_id, "op-7");
@@ -2064,7 +2081,7 @@ async fn recovery_reconstructs_result_from_committed_record() {
 
 // Regression: when an undo crashed (prepared written, file restored, commit
 // never written), recovery must not only synthesize the commit, but also
-// produce the correct wire-level result type (UndoResult, not WriteOrPatch).
+// produce the correct wire-level result type (UndoResult, not Mutation).
 #[tokio::test]
 async fn undo_recovery_produces_undo_result_when_replayed() {
     let root = tempfile::tempdir().unwrap();
@@ -2085,12 +2102,12 @@ async fn undo_recovery_produces_undo_result_when_replayed() {
     // Before-content blob so undo can verify.
     std::fs::write(blobs_dir.join("op-2.before"), before).unwrap();
 
-    // The original write that created "after" must exist for undo to target.
+    // The original create that made "after" must exist for undo to target.
     let original_write = serde_json::json!({
         "record_kind": "fs",
         "operation_id": "op-1",
         "request_id": "orig-req",
-        "kind": "write",
+        "kind": "create",
         "path": "f.txt",
         "before_hash": null,
         "after_hash": after_hash,
@@ -2123,7 +2140,7 @@ async fn undo_recovery_produces_undo_result_when_replayed() {
     let mut h = harness_at_with(root.path(), log_dir, None).await;
 
     // Replay the undo request: must return UndoResult (type: "undo"), NOT
-    // WriteOrPatch (type: "write").
+    // Mutation (type: "write").
     h.send(&req(
         "undo-crash-req",
         RequestBody::Undo {
@@ -2230,10 +2247,9 @@ async fn utf8_pagination_always_makes_progress() {
     // page (which would loop forever if the caller advances by returned bytes).
     h.send(&req(
         "w",
-        RequestBody::Write {
+        RequestBody::Create {
             path: "u.txt".into(),
             content: "é".into(),
-            base_hash: None,
         },
     ));
     let _ = h.recv().await;
@@ -2279,7 +2295,7 @@ async fn creation_undo_recovery_reports_none_restored_hash() {
         "record_kind": "fs",
         "operation_id": "op-1",
         "request_id": "create-req",
-        "kind": "write",
+        "kind": "create",
         "path": "new.txt",
         "before_hash": null,
         "after_hash": created_hash,
@@ -2436,7 +2452,7 @@ async fn corrupted_middle_log_line_fails_startup() {
         "record_kind": "fs",
         "operation_id": "op-1",
         "request_id": "r1",
-        "kind": "write",
+        "kind": "create",
         "path": "a.txt",
         "after_hash": "sha256:x",
         "timestamp_ms": 1,
@@ -2445,7 +2461,7 @@ async fn corrupted_middle_log_line_fails_startup() {
         "record_kind": "fs",
         "operation_id": "op-2",
         "request_id": "r2",
-        "kind": "write",
+        "kind": "create",
         "path": "b.txt",
         "after_hash": "sha256:y",
         "timestamp_ms": 2,
@@ -2482,7 +2498,7 @@ async fn corrupted_trailing_log_line_tolerated() {
         "record_kind": "fs",
         "operation_id": "op-1",
         "request_id": "r1",
-        "kind": "write",
+        "kind": "create",
         "path": "a.txt",
         "after_hash": "sha256:x",
         "timestamp_ms": 1,
@@ -2523,7 +2539,7 @@ async fn truncated_log_fixed_then_append_then_restart() {
         "record_kind": "fs",
         "operation_id": "op-1",
         "request_id": "r1",
-        "kind": "write",
+        "kind": "create",
         "path": "a.txt",
         "after_hash": "sha256:x",
         "timestamp_ms": 1,
@@ -2543,10 +2559,9 @@ async fn truncated_log_fixed_then_append_then_restart() {
         // were still in the file, the append would concatenate onto them.
         h.send(&req(
             "new",
-            RequestBody::Write {
+            RequestBody::Create {
                 path: "f.txt".into(),
                 content: "hi".into(),
-                base_hash: None,
             },
         ));
         let _ = h.recv().await;
@@ -2664,7 +2679,7 @@ async fn valid_record_without_trailing_newline_survives_restart() {
         "record_kind": "fs",
         "operation_id": "op-7",
         "request_id": "r7",
-        "kind": "write",
+        "kind": "create",
         "path": "x.txt",
         "after_hash": "sha256:abc",
         "timestamp_ms": 1,
@@ -2724,10 +2739,9 @@ async fn valid_record_without_trailing_newline_survives_restart() {
         let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
         h.send(&req(
             "w",
-            RequestBody::Write {
+            RequestBody::Create {
                 path: "y.txt".into(),
                 content: "z".into(),
-                base_hash: None,
             },
         ));
         let _ = h.recv().await;
@@ -2753,7 +2767,7 @@ async fn crash_truncated_partial_record_still_removed() {
         "record_kind": "fs",
         "operation_id": "op-1",
         "request_id": "r1",
-        "kind": "write",
+        "kind": "create",
         "path": "a.txt",
         "after_hash": "sha256:x",
         "timestamp_ms": 1,
@@ -2768,13 +2782,12 @@ async fn crash_truncated_partial_record_still_removed() {
 
     {
         let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
-        // Do a write. If truncation did NOT happen, this append would poison the log.
+        // Do a create. If truncation did NOT happen, this append would poison the log.
         h.send(&req(
             "w",
-            RequestBody::Write {
+            RequestBody::Create {
                 path: "f.txt".into(),
                 content: "hi".into(),
-                base_hash: None,
             },
         ));
         let _ = h.recv().await;
@@ -2813,7 +2826,7 @@ async fn crash_mid_utf8_codepoint_tail_recovered() {
     let ops_path = log_dir.join("operations.jsonl");
     std::fs::create_dir_all(&log_dir).unwrap();
 
-    let valid1 = r#"{"record_kind":"fs","operation_id":"op-1","request_id":"r1","kind":"write","path":"a.txt","after_hash":"sha256:x","timestamp_ms":1}"#;
+    let valid1 = r#"{"record_kind":"fs","operation_id":"op-1","request_id":"r1","kind":"create","path":"a.txt","after_hash":"sha256:x","timestamp_ms":1}"#;
     let mut raw = valid1.as_bytes().to_vec();
     raw.push(b'\n');
     raw.extend_from_slice(&[0xE6]); // partial byte of multi-byte character
@@ -2864,12 +2877,12 @@ async fn prepared_and_committed_same_id_reconcile_to_one() {
     let req_path = log_dir.join("requests.jsonl");
     std::fs::create_dir_all(&log_dir).unwrap();
 
-    let op1 = r#"{"record_kind":"fs","operation_id":"op-1","request_id":"r1","kind":"write","path":"a.txt","after_hash":"sha256:x","timestamp_ms":1}"#;
+    let op1 = r#"{"record_kind":"fs","operation_id":"op-1","request_id":"r1","kind":"create","path":"a.txt","after_hash":"sha256:x","timestamp_ms":1}"#;
     let prepared = serde_json::json!({
         "record_kind": "prepared",
         "operation_id": "op-2",
         "request_id": "w",
-        "kind": "write",
+        "kind": "create",
         "path": "f.txt",
         "expected_after_hash": "sha256:8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4",
         "timestamp_ms": 2,
@@ -2878,7 +2891,7 @@ async fn prepared_and_committed_same_id_reconcile_to_one() {
         "record_kind": "fs",
         "operation_id": "op-2",
         "request_id": "w",
-        "kind": "write",
+        "kind": "create",
         "path": "f.txt",
         "after_hash": "sha256:8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4",
         "timestamp_ms": 3,
@@ -2915,13 +2928,23 @@ async fn gc_prunes_operations_blobs_and_requests() {
     std::fs::create_dir_all(&log_dir).unwrap();
     {
         let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
-        for (i, content) in ["v1", "v2", "v3"].iter().enumerate() {
+        h.send(&req(
+            "w0",
+            RequestBody::Create {
+                path: "f.txt".into(),
+                content: "v1".into(),
+            },
+        ));
+        let _ = h.recv().await;
+        for (rid, old_c, new_c) in [("w1", "v1", "v2"), ("w2", "v2", "v3")] {
             h.send(&req(
-                &format!("w{i}"),
-                RequestBody::Write {
+                rid,
+                RequestBody::Edit {
                     path: "f.txt".into(),
-                    content: content.to_string(),
-                    base_hash: None,
+                    base_hash: hash_of(old_c),
+                    old_text: old_c.into(),
+                    new_text: new_c.into(),
+                    replace_all: false,
                 },
             ));
             let _ = h.recv().await;
@@ -2982,15 +3005,17 @@ async fn gc_prunes_operations_blobs_and_requests() {
         let mut h = harness_at_with(root.path(), log_dir, None).await;
         h.send(&req(
             "w-after",
-            RequestBody::Write {
+            RequestBody::Edit {
                 path: "f.txt".into(),
-                content: "v4".into(),
-                base_hash: None,
+                base_hash: hash_of("v2"),
+                old_text: "v2".into(),
+                new_text: "v4".into(),
+                replace_all: false,
             },
         ));
         match h.recv().await {
             ServerMessage::Result {
-                result: ResultBody::WriteOrPatch(w),
+                result: ResultBody::Mutation(w),
                 ..
             } => assert_eq!(w.operation_id, "op-5"),
             other => panic!("unexpected: {other:?}"),
@@ -3006,13 +3031,23 @@ async fn startup_prune_respects_history_limit() {
     std::fs::create_dir_all(&log_dir).unwrap();
     {
         let mut h = harness_at_with(root.path(), log_dir.clone(), None).await;
-        for i in 0..3 {
+        h.send(&req(
+            "w0",
+            RequestBody::Create {
+                path: "f.txt".into(),
+                content: "v0".into(),
+            },
+        ));
+        let _ = h.recv().await;
+        for (rid, old_c, new_c) in [("w1", "v0", "v1"), ("w2", "v1", "v2")] {
             h.send(&req(
-                &format!("w{i}"),
-                RequestBody::Write {
+                rid,
+                RequestBody::Edit {
                     path: "f.txt".into(),
-                    content: format!("v{i}"),
-                    base_hash: None,
+                    base_hash: hash_of(old_c),
+                    old_text: old_c.into(),
+                    new_text: new_c.into(),
+                    replace_all: false,
                 },
             ));
             let _ = h.recv().await;
@@ -3048,10 +3083,9 @@ async fn delete_roundtrip_undo_and_errors() {
     let mut h = harness().await;
     h.send(&req(
         "w",
-        RequestBody::Write {
+        RequestBody::Create {
             path: "d.txt".into(),
             content: "keep me".into(),
-            base_hash: None,
         },
     ));
     let _ = h.recv().await;
@@ -3064,7 +3098,7 @@ async fn delete_roundtrip_undo_and_errors() {
     ));
     match h.recv().await {
         ServerMessage::Result {
-            result: ResultBody::WriteOrPatch(w),
+            result: ResultBody::Mutation(w),
             ..
         } => {
             assert_eq!(w.operation_id, "op-2");

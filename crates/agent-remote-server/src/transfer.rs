@@ -14,6 +14,15 @@ use crate::workspace::Workspace;
 
 pub const TRANSFER_BUF_SIZE: usize = 64 * 1024;
 
+/// Staging filename convention: `.agent-remote-upload.<name>.<random>.part`.
+/// Deliberately unmistakable so stale-staging cleanup can match exactly this
+/// pattern and never touch anyone else's `.part` files.
+pub const STAGING_PREFIX: &str = ".agent-remote-upload.";
+pub const STAGING_SUFFIX: &str = ".part";
+/// A staging file whose mtime is older than this is considered abandoned (an
+/// in-progress upload keeps its mtime fresh with every written chunk).
+pub const STALE_STAGING_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 /// A staged upload awaiting commit. Lives only in memory: the staging file and
 /// this entry die with the server process, and a client whose connection
 /// dropped mid-transfer simply re-uploads.
@@ -92,12 +101,24 @@ pub fn upload_prepare(
         .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidRequest, "path has no file name"))?
         .to_string_lossy()
         .into_owned();
+    // A retried upload lands in the same directory as any staging file a
+    // crashed predecessor left behind, so this is the natural place to sweep.
+    let removed =
+        sweep_stale_staging_dir(parent, &in_flight_staging(registry), STALE_STAGING_MAX_AGE);
+    if removed > 0 {
+        tracing::info!(
+            dir = %parent.display(),
+            removed,
+            "removed stale upload staging files"
+        );
+    }
     // O_EXCL random name in the target's directory, so commit can link/rename
     // within one filesystem. Persisted (not auto-deleted): cleanup is owned by
-    // commit/abort; a hard-killed server may leave a .part file behind.
+    // commit/abort; a hard-killed server may leave a .part file behind, which
+    // the stale-staging sweep (here and in gc) eventually removes.
     let staging = tempfile::Builder::new()
-        .prefix(&format!(".{file_name}."))
-        .suffix(".part")
+        .prefix(&format!("{STAGING_PREFIX}{file_name}."))
+        .suffix(STAGING_SUFFIX)
         .tempfile_in(parent)
         .map_err(|e| ProtocolError::new(ErrorCode::IoError, format!("create staging file: {e}")))?
         .into_temp_path()
@@ -259,6 +280,80 @@ pub fn download_record(
     }))
 }
 
+/// Staging paths of uploads currently in flight; the sweeps must never touch
+/// these.
+pub fn in_flight_staging(registry: &UploadRegistry) -> std::collections::HashSet<PathBuf> {
+    registry
+        .lock()
+        .values()
+        .map(|p| p.staging.clone())
+        .collect()
+}
+
+/// Best-effort removal of abandoned upload staging files in one directory.
+/// Deletes only regular files matching the exact agent-remote staging naming
+/// convention, older than `max_age` by mtime, and not in `in_flight`. Never
+/// touches other `.part` files. Returns the number of files removed.
+pub fn sweep_stale_staging_dir(
+    dir: &Path,
+    in_flight: &std::collections::HashSet<PathBuf>,
+    max_age: std::time::Duration,
+) -> usize {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(STAGING_PREFIX) || !name.ends_with(STAGING_SUFFIX) {
+            continue;
+        }
+        let path = entry.path();
+        if in_flight.contains(&path) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age >= max_age);
+        if stale && std::fs::remove_file(&path).is_ok() {
+            tracing::info!(path = %path.display(), "removed stale upload staging file");
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Recursive sweep over a whole tree (workspace root or scratch root), used by
+/// gc. Does not follow symlinks.
+pub fn sweep_stale_staging_tree(
+    root: &Path,
+    in_flight: &std::collections::HashSet<PathBuf>,
+    max_age: std::time::Duration,
+) -> usize {
+    let mut removed = sweep_stale_staging_dir(root, in_flight, max_age);
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => return removed,
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            removed += sweep_stale_staging_tree(&entry.path(), in_flight, max_age);
+        }
+    }
+    removed
+}
+
 // ---- raw data plane (hidden CLI modes; no OperationStore, no state lock) ----
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -358,4 +453,67 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    #[test]
+    fn sweep_matches_only_the_exact_staging_convention() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join(".agent-remote-upload.f.bin.abc123.part");
+        let foreign_part = dir.path().join("download.part");
+        let dotted_part = dir.path().join(".f.bin.xyz.part");
+        let normal = dir.path().join("kept.txt");
+        for p in [&stale, &foreign_part, &dotted_part, &normal] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        // max_age zero makes every matching file stale, isolating the
+        // name-matching rule from the age rule.
+        let removed = sweep_stale_staging_dir(dir.path(), &HashSet::new(), Duration::ZERO);
+        assert_eq!(removed, 1);
+        assert!(!stale.exists());
+        assert!(foreign_part.exists());
+        assert!(dotted_part.exists());
+        assert!(normal.exists());
+    }
+
+    #[test]
+    fn sweep_spares_fresh_and_in_flight_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join(".agent-remote-upload.a.111.part");
+        let in_flight = dir.path().join(".agent-remote-upload.b.222.part");
+        std::fs::write(&fresh, b"x").unwrap();
+        std::fs::write(&in_flight, b"x").unwrap();
+
+        // Fresh mtime, generous threshold: nothing is stale.
+        let removed =
+            sweep_stale_staging_dir(dir.path(), &HashSet::new(), Duration::from_secs(3600));
+        assert_eq!(removed, 0);
+
+        // Registered in-flight staging survives even a zero threshold.
+        let mut registered = HashSet::new();
+        registered.insert(in_flight.clone());
+        let removed = sweep_stale_staging_dir(dir.path(), &registered, Duration::ZERO);
+        assert_eq!(removed, 1);
+        assert!(!fresh.exists());
+        assert!(in_flight.exists());
+    }
+
+    #[test]
+    fn tree_sweep_recurses_into_subdirectories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        let top = dir.path().join(".agent-remote-upload.t.1.part");
+        let deep = dir.path().join("a/b/.agent-remote-upload.d.2.part");
+        std::fs::write(&top, b"x").unwrap();
+        std::fs::write(&deep, b"x").unwrap();
+        let removed = sweep_stale_staging_tree(dir.path(), &HashSet::new(), Duration::ZERO);
+        assert_eq!(removed, 2);
+        assert!(!top.exists());
+        assert!(!deep.exists());
+    }
 }

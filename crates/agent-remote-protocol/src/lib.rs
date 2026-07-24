@@ -5,9 +5,9 @@ mod record;
 pub use error::{ErrorCode, ProtocolError};
 pub use messages::{
     ExecOutput, ExecResult, ExecTermination, FileEntry, FileMode, GcResult, ListEntry, ListKind,
-    ListResult, OperationDetails, OperationId, ReadResult, Request, RequestBody, RequestId,
-    RequestStatus, RequestStatusResult, ResultBody, ServerMessage, TransferResult, UndoResult,
-    UploadPrepareResult, WriteOrPatchResult,
+    ListResult, MutationResult, OperationDetails, OperationId, ReadResult, Request, RequestBody,
+    RequestId, RequestStatus, RequestStatusResult, ResultBody, ServerMessage, TransferResult,
+    UndoResult, UploadPrepareResult,
 };
 pub use record::{
     AbortedRecord, AnyOperationRecord, ExecDisposition, ExecOperationRecord, FsOperationRecord,

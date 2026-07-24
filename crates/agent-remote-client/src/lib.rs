@@ -2,9 +2,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use agent_remote_protocol::{
-    ErrorCode, ExecResult, FileEntry, ListResult, OperationDetails, ProtocolError, ReadResult,
-    Request, RequestBody, RequestId, RequestStatusResult, ServerMessage, UndoResult,
-    WriteOrPatchResult,
+    ErrorCode, ExecResult, FileEntry, ListResult, MutationResult, OperationDetails, ProtocolError,
+    ReadResult, Request, RequestBody, RequestId, RequestStatusResult, ServerMessage, UndoResult,
 };
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -278,56 +277,57 @@ impl Client {
         }
     }
 
-    pub async fn write(
-        &self,
-        path: &str,
-        content: &str,
-        base_hash: Option<&str>,
-    ) -> Result<WriteOrPatchResult, ClientError> {
+    /// Create a new text file; fails if the target already exists.
+    pub async fn create(&self, path: &str, content: &str) -> Result<MutationResult, ClientError> {
         let (_, msg) = self
-            .send_request(RequestBody::Write {
+            .send_request(RequestBody::Create {
                 path: path.into(),
                 content: content.into(),
-                base_hash: base_hash.map(|s| s.into()),
             })
             .await?;
         match Self::unpack(msg)? {
-            agent_remote_protocol::ResultBody::WriteOrPatch(w) => Ok(w),
+            agent_remote_protocol::ResultBody::Mutation(w) => Ok(w),
             _ => Err(ClientError::Server(ProtocolError::new(
                 ErrorCode::InvalidRequest,
-                "unexpected result body for write",
+                "unexpected result body for create",
             ))),
         }
     }
 
-    pub async fn patch(
+    /// Replace an exact occurrence of `old_text` with `new_text` in an
+    /// existing file. `base_hash` is required for optimistic concurrency.
+    pub async fn edit(
         &self,
         path: &str,
         base_hash: &str,
-        patch: &str,
-    ) -> Result<WriteOrPatchResult, ClientError> {
+        old_text: &str,
+        new_text: &str,
+        replace_all: bool,
+    ) -> Result<MutationResult, ClientError> {
         let (_, msg) = self
-            .send_request(RequestBody::Patch {
+            .send_request(RequestBody::Edit {
                 path: path.into(),
                 base_hash: base_hash.into(),
-                patch: patch.into(),
+                old_text: old_text.into(),
+                new_text: new_text.into(),
+                replace_all,
             })
             .await?;
         match Self::unpack(msg)? {
-            agent_remote_protocol::ResultBody::WriteOrPatch(w) => Ok(w),
+            agent_remote_protocol::ResultBody::Mutation(w) => Ok(w),
             _ => Err(ClientError::Server(ProtocolError::new(
                 ErrorCode::InvalidRequest,
-                "unexpected result body for patch",
+                "unexpected result body for edit",
             ))),
         }
     }
 
-    pub async fn delete(&self, path: &str) -> Result<WriteOrPatchResult, ClientError> {
+    pub async fn delete(&self, path: &str) -> Result<MutationResult, ClientError> {
         let (_, msg) = self
             .send_request(RequestBody::Delete { path: path.into() })
             .await?;
         match Self::unpack(msg)? {
-            agent_remote_protocol::ResultBody::WriteOrPatch(w) => Ok(w),
+            agent_remote_protocol::ResultBody::Mutation(w) => Ok(w),
             _ => Err(ClientError::Server(ProtocolError::new(
                 ErrorCode::InvalidRequest,
                 "unexpected result body for delete",

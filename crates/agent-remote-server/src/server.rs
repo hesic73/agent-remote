@@ -268,20 +268,15 @@ impl Server {
                 .with_stdout(&stdout)
                 .await;
             }
-            RequestBody::Write {
-                path,
-                content,
-                base_hash,
-            } => {
+            RequestBody::Create { path, content } => {
                 let guard = self.store.write_guard().await;
-                let result = fs_ops::write(
+                let result = fs_ops::create(
                     &self.workspace,
                     &self.store,
                     &guard,
                     &request_id,
                     &path,
                     &content,
-                    &base_hash,
                 );
                 drop(guard);
                 self.finish(&request_id, result)
@@ -289,20 +284,24 @@ impl Server {
                     .with_stdout(&stdout)
                     .await;
             }
-            RequestBody::Patch {
+            RequestBody::Edit {
                 path,
                 base_hash,
-                patch,
+                old_text,
+                new_text,
+                replace_all,
             } => {
                 let guard = self.store.write_guard().await;
-                let result = fs_ops::patch(
+                let result = fs_ops::edit(
                     &self.workspace,
                     &self.store,
                     &guard,
                     &request_id,
                     &path,
                     &base_hash,
-                    &patch,
+                    &old_text,
+                    &new_text,
+                    replace_all,
                 );
                 drop(guard);
                 self.finish(&request_id, result)
@@ -469,10 +468,21 @@ impl Server {
                 let guard = self.store.write_guard().await;
                 let result = match keep.or(self.history_limit) {
                     Some(k) => self.store.prune(k).map(|s| {
+                        let in_flight = transfer::in_flight_staging(&self.uploads);
+                        let removed_stale_staging = transfer::sweep_stale_staging_tree(
+                            &self.workspace.root,
+                            &in_flight,
+                            transfer::STALE_STAGING_MAX_AGE,
+                        ) + transfer::sweep_stale_staging_tree(
+                            &self.workspace.scratch_root,
+                            &in_flight,
+                            transfer::STALE_STAGING_MAX_AGE,
+                        );
                         ResultBody::Gc(agent_remote_protocol::GcResult {
                             removed_operations: s.removed_operations,
                             removed_requests: s.removed_requests,
                             retained_operations: s.retained_operations,
+                            removed_stale_staging,
                         })
                     }),
                     None => Err(agent_remote_protocol::ProtocolError::new(
@@ -534,6 +544,7 @@ impl Server {
                     operation_id: o.operation_id.clone(),
                     termination: o.termination,
                     duration_ms: o.duration_ms,
+                    drain_timed_out: o.drain_timed_out,
                     stdout: o.stdout.clone(),
                     stderr: o.stderr.clone(),
                 };
@@ -546,6 +557,7 @@ impl Server {
                     timeout_ms: Some(timeout_ms.unwrap_or(exec::DEFAULT_TIMEOUT_MS)),
                     disposition,
                     termination: Some(o.termination),
+                    drain_timed_out: o.drain_timed_out,
                     duration_ms: o.duration_ms,
                     timestamp_ms: now_ms(),
                     error: if matches!(
@@ -613,6 +625,7 @@ impl Server {
                     timeout_ms,
                     disposition: agent_remote_protocol::ExecDisposition::Rejected,
                     termination: None,
+                    drain_timed_out: false,
                     duration_ms: 0,
                     timestamp_ms: now_ms(),
                     error: Some(e.message.clone()),
@@ -717,8 +730,8 @@ fn op_kind_str(body: &RequestBody) -> &str {
         RequestBody::List { .. } => "list",
         RequestBody::Stat { .. } => "stat",
         RequestBody::Read { .. } => "read",
-        RequestBody::Write { .. } => "write",
-        RequestBody::Patch { .. } => "patch",
+        RequestBody::Create { .. } => "create",
+        RequestBody::Edit { .. } => "edit",
         RequestBody::Exec { .. } => "exec",
         RequestBody::Delete { .. } => "delete",
         RequestBody::Undo { .. } => "undo",

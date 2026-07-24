@@ -46,7 +46,7 @@ host or for trying things out:
 WS=$(mktemp -d)
 SRV=$(pwd)/target/release/agent-remote-server
 
-agent-remote --local --remote-bin "$SRV" --root "$WS" write hello.txt <<< "hi there"
+agent-remote --local --remote-bin "$SRV" --root "$WS" create hello.txt <<< "hi there"
 agent-remote --local --remote-bin "$SRV" --root "$WS" cat hello.txt
 agent-remote --local --remote-bin "$SRV" --root "$WS" exec -- make test
 ```
@@ -101,8 +101,8 @@ environment.
 | `ls <path> [--offset N] [--limit N]` | List a directory |
 | `stat <path>` | Stat a file or directory |
 | `cat <path> [--offset N] [--limit N]` | Read a file |
-| `write <path> [--file F] [--base-hash H]` | Write content (file or stdin) |
-| `patch <path> --base-hash H [--file F]` | Apply a patch (see below) |
+| `create <path> [--file F]` | Create a new file (content from file or stdin); fails if it exists |
+| `edit <path> --base-hash H --old-text S --new-text S [--replace-all]` | Exact text replacement in an existing file |
 | `rm <path>` | Delete a file |
 | `exec [--cwd DIR] [--profile P] [--timeout-ms N] -- argv...` | Run a command |
 | `undo <operation_id>` | Undo a recorded file change |
@@ -142,19 +142,17 @@ One server per workspace root: the state directory holds an exclusive lock,
 so a second concurrent session fails fast instead of corrupting the logs
 (reconnects get a short grace period while the predecessor exits).
 
-### Patch format
+### Editing model
 
-A small line-based edit script (not unified diff), one edit per line, with
-1-based line numbers referring to the original content:
-
-| Syntax | Meaning |
-|--------|---------|
-| `<n>c <text>` | Change line `n` to `<text>` |
-| `<n>d` | Delete line `n` |
-| `<n>a <text>` | Insert `<text>` after line `n` (`0a` inserts at the top) |
-| `# ...` / blank | Ignored |
-
-Conflicting or out-of-range edits are rejected and the file is left untouched.
+One intent, one operation: new text files are made with `create` (refuses an
+existing path with `ALREADY_EXISTS`), and existing text files are changed only
+with `edit`. `edit` is exact text replacement: `old_text` must match the
+current content exactly; zero occurrences fail with `NO_MATCH`, several with
+`AMBIGUOUS_MATCH` unless `replace_all` is set. An empty `new_text` deletes the
+matched text; a full-file rewrite is expressed by passing the whole current
+content as `old_text`. Inputs, the edited file, and the result are bounded at
+4 MiB -- larger or binary files go through the transfer tools. A failed edit
+leaves the file byte-for-byte untouched.
 
 ## MCP server (use from a coding agent)
 
@@ -195,9 +193,11 @@ state directory) -- so a failing call tells you which layer broke.
 claude mcp add agent-remote -- agent-remote-mcp
 ```
 
-Tools: `list_workspaces`, `list_dir`, `stat`, `read_file`, `write_file`,
-`patch_file`, `delete_file`, `run_command`, `upload_file`, `download_file`,
-`undo`, `history`, `operation_get`, `request_status`. Every tool except
+Tools: `list_workspaces`, `list_directory`, `read_file`, `create_file`,
+`edit_file`, `delete_file`, `run_command`, `upload_file`, `download_file`,
+`undo`, `history`, `operation_get`, `request_status`. Each common intent has
+exactly one canonical tool; search, file discovery, Git, builds, and tests all
+go through `run_command`. Every tool except
 `list_workspaces` takes a required `workspace` argument naming which
 workspace to act on. Workspaces are fully isolated: state, operation IDs,
 history, and undo are scoped per workspace (server-side, keyed by root), and
@@ -210,18 +210,35 @@ rejected at startup).
 machine and the remote workspace (or `@scratch/...`). They are synchronous and
 stream raw bytes over a dedicated SSH process with a fixed-size buffer -- file
 content never passes through the JSONL protocol or the model context, and
-memory use does not grow with file size. Both ends compute SHA-256 and the
-transfer only commits (atomically, on the remote via rename/link, locally via
-temp-file rename) when size and hash match. Existing destinations are refused
-unless `overwrite=true`; parent directories are never created implicitly. The
-result and the operation log carry metadata only: direction, remote path,
-size, `sha256:...`, duration. Transfers cannot be undone, and there is no
-resume -- a failed or disconnected transfer leaves the destination absent (or
-untouched), and you simply call the tool again.
+memory use does not grow with file size. Both ends compute SHA-256 while
+streaming. For uploads, the receiving process reports the remote size and
+hash and the client verifies them against the local file before committing;
+the commit step itself re-checks the staged size but does not rehash the
+staging file (single-pass by design -- the client-side hash comparison is the
+integrity check, under the same-user trust model). Downloads verify the
+sender's declared size and hash locally before installing. Installation is
+atomic (rename/link on the remote, temp-file rename locally). Existing
+destinations are refused unless `overwrite=true`; parent directories are
+never created implicitly. The result and the operation log carry metadata
+only: direction, remote path, size, `sha256:...`, duration. Transfers cannot
+be undone, and there is no resume -- a failed or disconnected transfer leaves
+the destination absent (or untouched), and you simply call the tool again.
+
+A hard-killed upload can leave its staging file
+(`.agent-remote-upload.<name>.<random>.part`) in the target directory. These
+are swept conservatively: only files matching that exact naming convention,
+older than 24 hours, and not part of an in-flight upload are deleted -- on the
+next upload into the same directory and during `gc` (which walks the workspace
+and scratch roots and reports the count as `removed_stale_staging`).
 
 Tool failures come back as MCP `isError` results. `run_command` is synchronous
 and returns a server-bounded preview for each stream: the first 4 KiB and last
-12 KiB, together with byte counts and termination details. Full logs belong in
+12 KiB, together with byte counts and termination details. Every invocation
+reaches a terminal response within a bounded period: after the command exits,
+output collection waits a short grace period for the pipes to close, then
+kills any descendants still holding them and sets `drain_timed_out` in the
+result (detached workloads belong in a remote supervisor such as tmux, with
+pipes redirected away). Full logs belong in
 the server-managed `@scratch/...` namespace and can be paged with `read_file`.
 Reads are limited to 64 KiB per call. Directory listings return at most 1,000
 entries with `next_offset`. History defaults to 50 records, has a hard maximum
@@ -240,9 +257,9 @@ cannot leave an orphaned connection holding the remote state lock.
   resolves inside a separate server-managed scratch root. `..`, absolute
   paths, and symlinks escaping either root are rejected. Guards against
   accidents, not adversaries -- `exec` can still touch anything the user can.
-- **Atomic writes.** `write`/`patch` build the full result, then atomically
-  rename into place, preserving file mode. A failed patch changes nothing.
-- **Optimistic concurrency.** Mutations accept `base_hash` and are rejected
+- **Atomic mutations.** `create`/`edit` build the full result, then atomically
+  install it (`edit` preserves file mode). A failed edit changes nothing.
+- **Optimistic concurrency.** `edit` requires `base_hash` and is rejected
   with `STALE_FILE` if the file changed; `read` returns a hash usable
   directly as the next `base_hash`.
 - **Durable, recoverable log.** Every operation is recorded in fsync'd JSONL

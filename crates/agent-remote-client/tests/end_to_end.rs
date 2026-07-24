@@ -63,14 +63,11 @@ async fn make_client(root: &Path) -> Client {
 }
 
 #[tokio::test]
-async fn end_to_end_write_read_list_stat() {
+async fn end_to_end_create_read_list_stat() {
     let dir = tempfile::tempdir().unwrap();
     let client = make_client(dir.path()).await;
 
-    let w = client
-        .write("src/main.py", "print('hi')\n", None)
-        .await
-        .unwrap();
+    let w = client.create("src/main.py", "print('hi')\n").await.unwrap();
     assert!(w.operation_id.starts_with("op-"));
 
     let r = client.read("src/main.py", None, None).await.unwrap();
@@ -88,13 +85,16 @@ async fn end_to_end_write_read_list_stat() {
 }
 
 #[tokio::test]
-async fn end_to_end_patch_with_base_hash() {
+async fn end_to_end_edit_with_base_hash() {
     let dir = tempfile::tempdir().unwrap();
     let client = make_client(dir.path()).await;
 
-    let w = client.write("f.txt", "a\nb\nc\n", None).await.unwrap();
-    let patched = client.patch("f.txt", &w.new_hash, "2c BEE").await.unwrap();
-    assert_ne!(patched.new_hash, w.new_hash);
+    let w = client.create("f.txt", "a\nb\nc\n").await.unwrap();
+    let edited = client
+        .edit("f.txt", &w.new_hash, "b\n", "BEE\n", false)
+        .await
+        .unwrap();
+    assert_ne!(edited.new_hash, w.new_hash);
 
     let r = client.read("f.txt", None, None).await.unwrap();
     assert_eq!(r.content, "a\nBEE\nc\n");
@@ -104,10 +104,10 @@ async fn end_to_end_patch_with_base_hash() {
 async fn end_to_end_stale_hash_errors() {
     let dir = tempfile::tempdir().unwrap();
     let client = make_client(dir.path()).await;
-    let _ = client.write("f.txt", "v1", None).await.unwrap();
+    let _ = client.create("f.txt", "v1").await.unwrap();
     // Wrong base hash.
     let err = client
-        .write("f.txt", "v2", Some("sha256:deadbeef"))
+        .edit("f.txt", "sha256:deadbeef", "v1", "v2", false)
         .await
         .unwrap_err();
     match err {
@@ -144,9 +144,9 @@ async fn end_to_end_exec_returns_bounded_result() {
 async fn end_to_end_undo_and_history() {
     let dir = tempfile::tempdir().unwrap();
     let client = make_client(dir.path()).await;
-    let w = client.write("u.txt", "first\n", None).await.unwrap();
+    let w = client.create("u.txt", "first\n").await.unwrap();
     let _ = client
-        .write("u.txt", "second\n", Some(&w.new_hash))
+        .edit("u.txt", &w.new_hash, "first\n", "second\n", false)
         .await
         .unwrap();
 
@@ -168,7 +168,7 @@ async fn end_to_end_status_query() {
     assert_eq!(s.status, agent_remote_protocol::RequestStatus::Unknown);
 
     // Execute then query.
-    let w = client.write("q.txt", "q", None).await.unwrap();
+    let w = client.create("q.txt", "q").await.unwrap();
     let s = client.request_status("__noop__").await.unwrap();
     let _ = s;
     // We don't know the request_id the client generated internally, but we can
@@ -270,8 +270,13 @@ async fn end_to_end_gc_prunes_history() {
     let dir = tempfile::tempdir().unwrap();
     let client = make_client(dir.path()).await;
 
-    for v in ["1", "2", "3"] {
-        client.write("a.txt", v, None).await.unwrap();
+    let mut hash = client.create("a.txt", "1").await.unwrap().new_hash;
+    for (old, new) in [("1", "2"), ("2", "3")] {
+        hash = client
+            .edit("a.txt", &hash, old, new, false)
+            .await
+            .unwrap()
+            .new_hash;
     }
     let g = client.gc(Some(1)).await.unwrap();
     assert_eq!(g.removed_operations, 2);
@@ -286,7 +291,7 @@ async fn end_to_end_delete_and_undo() {
     let dir = tempfile::tempdir().unwrap();
     let client = make_client(dir.path()).await;
 
-    client.write("d.txt", "precious", None).await.unwrap();
+    client.create("d.txt", "precious").await.unwrap();
     let del = client.delete("d.txt").await.unwrap();
     assert!(!dir.path().join("d.txt").exists());
     assert_eq!(del.new_hash, "sha256:");
@@ -344,7 +349,7 @@ async fn cli_over_fake_ssh_quotes_paths_with_spaces() {
 
     let mut child = std::process::Command::new(cli)
         .args(&common)
-        .args(["write", "f.txt"])
+        .args(["create", "f.txt"])
         .env("PATH", &path_env)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

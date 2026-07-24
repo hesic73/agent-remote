@@ -69,21 +69,25 @@ enum Command {
         #[arg(long)]
         limit: Option<u64>,
     },
-    /// Write content (from --file or stdin) to a path.
-    Write {
+    /// Create a new file with content from --file or stdin. Fails if the
+    /// target already exists; modify existing files with `edit`.
+    Create {
         path: String,
         #[arg(long)]
         file: Option<PathBuf>,
-        #[arg(long)]
-        base_hash: Option<String>,
     },
-    /// Apply a patch script. Patch text from --file or stdin.
-    Patch {
+    /// Replace an exact occurrence of --old-text with --new-text in an
+    /// existing file.
+    Edit {
         path: String,
         #[arg(long)]
         base_hash: String,
         #[arg(long)]
-        file: Option<PathBuf>,
+        old_text: String,
+        #[arg(long)]
+        new_text: String,
+        #[arg(long)]
+        replace_all: bool,
     },
     /// Execute a command remotely.
     Exec {
@@ -206,22 +210,21 @@ async fn async_main_real() -> Result<()> {
                 eprintln!("\n[truncated: use --offset {next}]");
             }
         }
-        Command::Write {
-            path,
-            file,
-            base_hash,
-        } => {
+        Command::Create { path, file } => {
             let content = read_input(file)?;
-            let res = client.write(&path, &content, base_hash.as_deref()).await?;
+            let res = client.create(&path, &content).await?;
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
-        Command::Patch {
+        Command::Edit {
             path,
             base_hash,
-            file,
+            old_text,
+            new_text,
+            replace_all,
         } => {
-            let patch = read_input(file)?;
-            let res = client.patch(&path, &base_hash, &patch).await?;
+            let res = client
+                .edit(&path, &base_hash, &old_text, &new_text, replace_all)
+                .await?;
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
         Command::Exec {

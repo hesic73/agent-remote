@@ -3,7 +3,6 @@ pub mod exec;
 pub mod fs_ops;
 pub mod fsync;
 pub mod hash;
-pub mod patch;
 pub mod server;
 pub mod store;
 pub mod transfer;

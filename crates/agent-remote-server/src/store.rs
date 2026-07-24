@@ -407,7 +407,7 @@ impl OperationStore {
             g.push(any);
         }
         drop(g);
-        // Reconstruct the correct terminal result (WriteOrPatch vs UndoResult
+        // Reconstruct the correct terminal result (Mutation vs UndoResult
         // depending on kind) so replay/status work after restart.
         let msg = self.reconstruct_result(&AnyOperationRecord::Fs(record));
         self.remember_result(&p.request_id, msg)?;
@@ -666,15 +666,17 @@ impl OperationStore {
         match record {
             AnyOperationRecord::Fs(fs) => {
                 let body = match fs.kind {
-                    OperationKind::Write | OperationKind::Patch | OperationKind::Delete => {
-                        agent_remote_protocol::ResultBody::WriteOrPatch(
-                            agent_remote_protocol::WriteOrPatchResult {
-                                operation_id: fs.operation_id.clone(),
-                                old_hash: fs.before_hash.clone(),
-                                new_hash: fs.after_hash.clone(),
-                            },
-                        )
-                    }
+                    OperationKind::Create
+                    | OperationKind::Edit
+                    | OperationKind::Write
+                    | OperationKind::Patch
+                    | OperationKind::Delete => agent_remote_protocol::ResultBody::Mutation(
+                        agent_remote_protocol::MutationResult {
+                            operation_id: fs.operation_id.clone(),
+                            old_hash: fs.before_hash.clone(),
+                            new_hash: fs.after_hash.clone(),
+                        },
+                    ),
                     OperationKind::Undo => {
                         // The undo's FsOperationRecord records:
                         //   before_hash = hash before undo ran (the "after"
@@ -729,6 +731,7 @@ impl OperationStore {
                                     operation_id: e.operation_id.clone(),
                                     termination,
                                     duration_ms: e.duration_ms,
+                                    drain_timed_out: e.drain_timed_out,
                                     stdout: e.stdout.clone(),
                                     stderr: e.stderr.clone(),
                                 },

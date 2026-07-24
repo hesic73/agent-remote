@@ -13,6 +13,12 @@ pub const OUTPUT_PREFIX_LIMIT: usize = 4 * 1024;
 pub const OUTPUT_SUFFIX_LIMIT: usize = 12 * 1024;
 pub const DEFAULT_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 pub const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
+/// After the direct child terminates, output collection waits at most this
+/// long for the pipes to reach EOF. A descendant that inherited stdout/stderr
+/// (e.g. `some-server &`) would otherwise hold the drain open indefinitely;
+/// at the deadline the whole process group is SIGKILLed and the readers are
+/// abandoned. Detached workloads are not a supported property of exec.
+pub const DRAIN_GRACE_MS: u64 = 2_000;
 
 pub struct ExecOutcome {
     pub operation_id: OperationId,
@@ -20,6 +26,7 @@ pub struct ExecOutcome {
     pub stdout: ExecOutput,
     pub stderr: ExecOutput,
     pub duration_ms: u64,
+    pub drain_timed_out: bool,
 }
 
 enum StreamEvent {
@@ -92,9 +99,13 @@ pub async fn exec(
         .kill_on_drop(true);
     unsafe {
         // Isolate the command tree so timeout kills descendants that inherited
-        // a pipe as well as the direct child.
+        // a pipe as well as the direct child. A failed setsid must abort the
+        // spawn: without our own process group, group-kill on timeout or drain
+        // expiry would signal the wrong processes.
         cmd.pre_exec(|| {
-            libc::setsid();
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
@@ -145,8 +156,27 @@ pub async fn exec(
     if matches!(termination, ExecTermination::TimedOut) {
         let _ = child.wait().await;
     }
-    while let Some(event) = rx.recv().await {
-        capture(event, &mut captured_stdout, &mut captured_stderr);
+    // Bounded final drain. The direct child has exited (or been killed), but a
+    // descendant that inherited stdout/stderr can keep the pipes open past the
+    // child's lifetime. Waiting for channel close here without a deadline
+    // would hang until that descendant exits. Policy: give the pipes a short
+    // grace period to reach EOF; if they do not, SIGKILL the process group and
+    // abandon the readers, reporting drain_timed_out so the caller knows
+    // collection stopped before pipe EOF.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(DRAIN_GRACE_MS);
+    let mut drain_timed_out = false;
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep_until(drain_deadline) => {
+                kill_process_group(pid);
+                drain_timed_out = true;
+                break;
+            }
+            event = rx.recv() => match event {
+                Some(event) => capture(event, &mut captured_stdout, &mut captured_stderr),
+                None => break,
+            }
+        }
     }
 
     Ok(ExecOutcome {
@@ -155,6 +185,7 @@ pub async fn exec(
         stdout: captured_stdout.finish(),
         stderr: captured_stderr.finish(),
         duration_ms: start.elapsed().as_millis() as u64,
+        drain_timed_out,
     })
 }
 

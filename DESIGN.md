@@ -91,7 +91,7 @@ Interactive sessions (PTY, REPL, persistent shell) are out of scope.
 ## Operations
 
 ```text
-list  stat  read  write  patch  delete  exec
+list  stat  read  create  edit  delete  exec
 undo  history  operation.get  request.status  gc
 upload_prepare  upload_commit  upload_abort  download_record   (transfer control plane)
 ```
@@ -105,18 +105,31 @@ upload_prepare  upload_commit  upload_abort  download_record   (transfer control
 {"request_id":"r1","type":"read","content":"...","hash":"sha256:abc","truncated":true,"next_offset":65536}
 ```
 
-### Mutations: optimistic concurrency, all-or-nothing
+### Mutations: one intent, one operation
 
-`write`/`patch` accept a `base_hash` (`patch` requires it). The server checks
-the current hash first and rejects with `STALE_FILE` (carrying
-`expected_hash`/`actual_hash`) if the file changed under you. Mutations build
-the complete new content, then atomically rename into place -- a failed patch
-leaves the file byte-for-byte unchanged. Success returns an `operation_id`
-plus `old_hash`/`new_hash`.
+Creation and modification are deliberately separate, so there is exactly one
+canonical way to perform each:
 
-The patch format is a small line-based edit script (change/delete/insert by
-1-based line number), not unified diff; conflicting or out-of-range edits are
-rejected as a whole.
+* `create` makes a NEW text file and fails with `ALREADY_EXISTS` if the path
+  exists (installed atomically via an exclusive link, so even a concurrent
+  creator cannot be clobbered).
+* `edit` modifies an EXISTING text file by exact text replacement, the
+  editing semantics coding models already know: `old_text` must match the
+  current content exactly; zero occurrences fail with `NO_MATCH`, several
+  with `AMBIGUOUS_MATCH` unless `replace_all` is set; an empty `new_text`
+  deletes the matched text. A full-file rewrite passes the entire current
+  content as `old_text`, keeping destructive replacement explicit.
+
+`edit` requires a `base_hash`. The server checks the current hash first and
+rejects with `STALE_FILE` (carrying `expected_hash`/`actual_hash`) if the
+file changed under you. Mutations build the complete new content, then
+atomically rename into place (preserving file mode) -- a failed edit leaves
+the file byte-for-byte unchanged. Success returns an `operation_id` plus
+`old_hash`/`new_hash`. Inputs, the edited file, and the result are bounded at
+4 MiB; larger or binary files use the transfer path.
+
+The earlier line-based `patch` operation was removed rather than kept as a
+second editing mechanism; logs recorded by older servers still load.
 
 ### Exec
 
@@ -128,6 +141,18 @@ rejected as a whole.
 The result is synchronous and bounded: each stream retains its first 4 KiB and
 last 12 KiB. `exec` promises no transactionality and no undo -- it can do
 anything the remote user can.
+
+`exec` owns the command's process tree (the child runs in its own session via
+`setsid`, whose failure aborts the spawn). The central invariant: every
+invocation reaches a terminal response within a bounded period, including
+subprocess cleanup. After the direct child exits, output collection waits a
+short grace period (2 s) for stdout/stderr to reach EOF; a descendant that
+inherited the pipes and still holds them at the deadline is SIGKILLed along
+with the rest of the process group, the readers are abandoned, and the result
+carries `drain_timed_out: true` to say collection stopped before pipe EOF. A
+descendant that redirected its output away (the tmux/nohup pattern) closes
+the pipes at exit and survives. Timeout kills the whole process group
+immediately. Detached workloads are not a supported property of `exec`.
 
 ### File transfer
 
@@ -148,25 +173,43 @@ the same workspace/`@scratch` boundary rules as every other operation.
 
 Uploads are three-phase on the control plane: `upload_prepare` validates the
 target (parent must exist; existing targets refused unless `overwrite`) and
-creates a random `.part` staging file in the target's directory;
-`upload_commit` verifies the staged size, installs atomically (rename for
-overwrite, hard-link-then-unlink for race-free no-replace), fsyncs, and appends
-the operation record; `upload_abort` deletes the staging file after a failure.
-The staging path travels only between the resident server and the client; it is
-never persisted or shown to the agent. Downloads verify size and SHA-256
-against the sender's framing, install locally via temp file + (no-clobber)
-rename, then append a `download_record`.
+creates a staging file named `.agent-remote-upload.<name>.<random>.part` in
+the target's directory; `upload_commit` verifies the staged size, installs
+atomically (rename for overwrite, hard-link-then-unlink for race-free
+no-replace), fsyncs, and appends the operation record; `upload_abort` deletes
+the staging file after a failure. The staging path travels only between the
+resident server and the client; it is never persisted or shown to the agent.
+Downloads verify size and SHA-256 against the sender's framing, install
+locally via temp file + (no-clobber) rename, then append a `download_record`.
 
-Both directions stream through fixed 64 KiB buffers with SHA-256 computed on
-each side; memory does not grow with file size. Operation records are
-metadata-only (direction, remote logical path, size, hash, duration) -- no
-local paths, no content. Transfers are synchronous, cannot be undone, and have
-no resume/job machinery: a dropped connection fails the call, the destination
-is never left half-written, and the caller just retries.
+Upload integrity is verified once, in a single pass: the receive process
+hashes the bytes as they stream into the staging file and reports
+`{size, sha256}`, which the client checks against the local file before
+committing. `upload_commit` re-checks the staged byte count but does NOT
+rehash the staging file -- rehashing would read large files twice, and the
+workspace is not defended against the same OS user anyway (that is the
+documented trust model).
+
+A hard-killed or interrupted upload can leave its staging file behind.
+Cleanup is conservative and best-effort: only files matching the exact
+`.agent-remote-upload.*.part` convention, older than 24 hours by mtime (an
+active upload keeps its mtime fresh), and not registered as in-flight are
+deleted. The sweep runs where staging files accumulate -- the target
+directory on each `upload_prepare` -- and over the whole workspace and
+scratch trees on `gc`, which reports the count as `removed_stale_staging`.
+Startup deliberately does not walk the tree: a server starts on every
+reconnect, and an unbounded scan there would tax large workspaces.
+
+Both directions stream through fixed 64 KiB buffers; memory does not grow
+with file size. Operation records are metadata-only (direction, remote
+logical path, size, hash, duration) -- no local paths, no content. Transfers
+are synchronous, cannot be undone, and have no resume/job machinery: a
+dropped connection fails the call, the destination is never left
+half-written, and the caller just retries.
 
 ## Undo
 
-Applies only to recorded file mutations (`write`, `patch`, `delete`). Each
+Applies only to recorded file mutations (`create`, `edit`, `delete`). Each
 mutation stores `before_hash`, `after_hash`, and a `before` blob. Undo runs
 only if `current_hash == after_hash`, otherwise returns `UNDO_CONFLICT`
 instead of clobbering later changes. Undoing a file creation removes the
@@ -243,10 +286,12 @@ multiplexes a fleet of named workspaces, declared in a single TOML file
 (`~/.agent-remote/workspaces.toml` by convention). A workspace is a `(machine,
 root)` pair; "two roots on one machine" and "one root each on two machines"
 are the same concept, because all server-side state is already keyed per
-root. The agent sees tools: `list_workspaces`, `list_dir`, `stat`,
-`read_file`, `write_file`, `patch_file`, `delete_file`, `run_command`,
+root. The agent sees tools: `list_workspaces`, `list_directory`,
+`read_file`, `create_file`, `edit_file`, `delete_file`, `run_command`,
 `upload_file`, `download_file`, `undo`, `history`, `operation_get`,
-`request_status` -- each (except `list_workspaces`) with a required
+`request_status` -- one canonical tool per intent (search, file discovery,
+Git, builds, and tests all go through `run_command`; no wrapper tools), and
+each (except `list_workspaces`) with a required
 `workspace` argument. Making it required, with no default, is deliberate: a
 call can never land on the wrong machine because a default silently filled
 in. Results echo the workspace name, since operation and request IDs are
@@ -303,6 +348,16 @@ that drive the real `agent-remote-mcp` binary.
 
 Post-MVP additions, all implemented and tested:
 
+* [x] Canonical editing surface: `create` (new files only) and `edit` (exact
+  text replacement with `NO_MATCH`/`AMBIGUOUS_MATCH`/`replace_all`) replace
+  `write`/`patch`; one tool per intent, old logs still load
+* [x] Bounded exec lifecycle: `setsid` failure aborts the spawn; after the
+  child exits a 2 s drain grace bounds pipe collection, leftover
+  pipe-holding descendants are killed, and `drain_timed_out` reports early
+  cutoff -- with process-tree regression tests
+* [x] Conservative stale-upload-staging cleanup (exact
+  `.agent-remote-upload.*.part` convention, 24 h threshold, prepare-time and
+  `gc` sweeps)
 * [x] Raw streaming file transfer (`upload_file`/`download_file`): dedicated
   per-transfer data plane, atomic install, SHA-256 verified both ways,
   metadata-only records
@@ -316,9 +371,10 @@ Post-MVP additions, all implemented and tested:
 The original MVP criteria, all implemented and tested:
 
 * [x] Persistent SSH stdio session from client to server
-* [x] `list`, `stat`, `read`, `write`, `patch`, `delete`, `exec`
-* [x] All-or-nothing single-file write/patch
-* [x] `read` returns hash; `write`/`patch` accept `base_hash`
+* [x] `list`, `stat`, `read`, `delete`, `exec`, plus single-file mutations
+  (originally `write`/`patch`, since replaced by `create`/`edit`)
+* [x] All-or-nothing single-file mutations
+* [x] `read` returns hash; mutations check `base_hash`
 * [x] `exec` returns bounded stdout/stderr previews and termination details
 * [x] Operation IDs and fsync'd JSONL log with crash recovery
 * [x] Client interaction log

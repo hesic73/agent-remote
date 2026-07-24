@@ -137,7 +137,7 @@ fn ok_json_in_workspace<T: serde::Serialize>(workspace: &str, value: &T) -> Call
 // ---- Input structs ----
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ListDirInput {
+pub struct ListDirectoryInput {
     #[schemars(description = "Workspace name (see list_workspaces)")]
     pub workspace: String,
     #[schemars(
@@ -165,43 +165,37 @@ pub struct ReadFileInput {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct StatInput {
-    #[schemars(description = "Workspace name (see list_workspaces)")]
-    pub workspace: String,
-    #[schemars(
-        description = "File or directory path relative to workspace, or @scratch/... for server-managed scratch"
-    )]
-    pub path: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WriteFileInput {
+pub struct CreateFileInput {
     #[schemars(description = "Workspace name (see list_workspaces)")]
     pub workspace: String,
     #[schemars(
         description = "File path relative to workspace, or @scratch/... for server-managed scratch"
     )]
     pub path: String,
-    #[schemars(description = "Full file content to write")]
+    #[schemars(description = "Full content of the new file")]
     pub content: String,
-    #[schemars(
-        description = "Expected current hash for optimistic concurrency; omit to skip check"
-    )]
-    pub base_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PatchFileInput {
+pub struct EditFileInput {
     #[schemars(description = "Workspace name (see list_workspaces)")]
     pub workspace: String,
     #[schemars(
         description = "File path relative to workspace, or @scratch/... for server-managed scratch"
     )]
     pub path: String,
-    #[schemars(description = "Expected current hash (required for optimistic concurrency)")]
+    #[schemars(description = "Current file hash, as returned by read_file")]
     pub base_hash: String,
-    #[schemars(description = "Patch script: one edit per line, e.g. \"2c NEW\" to change line 2")]
-    pub patch: String,
+    #[schemars(
+        description = "Exact text to replace; must match the current file content exactly, including whitespace"
+    )]
+    pub old_text: String,
+    #[schemars(description = "Replacement text; empty string deletes old_text")]
+    pub new_text: String,
+    #[schemars(
+        description = "Replace every occurrence instead of failing when old_text is not unique (default: false)"
+    )]
+    pub replace_all: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -234,7 +228,9 @@ pub struct RunCommandInput {
 pub struct UndoInput {
     #[schemars(description = "Workspace name the operation was recorded in")]
     pub workspace: String,
-    #[schemars(description = "Operation ID to undo (from write/patch/delete result)")]
+    #[schemars(
+        description = "Operation ID to undo (from a create_file/edit_file/delete_file result)"
+    )]
     pub operation_id: String,
 }
 
@@ -418,14 +414,14 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(description = "List the contents of a directory in a workspace.")]
-    async fn list_dir(
+    async fn list_directory(
         &self,
-        Parameters(ListDirInput {
+        Parameters(ListDirectoryInput {
             workspace,
             path,
             offset,
             limit,
-        }): Parameters<ListDirInput>,
+        }): Parameters<ListDirectoryInput>,
     ) -> CallToolResult {
         let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
@@ -459,7 +455,7 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Read the content of a file. Returns text, a hash for concurrency, and truncation status."
+        description = "Read a text file. Returns the content, the file hash (pass it to edit_file as base_hash), and a next offset when the file is larger than one page. Refuses binary (non-UTF-8) files; move those with download_file."
     )]
     async fn read_file(
         &self,
@@ -491,40 +487,24 @@ impl RemoteWorkspaceServer {
         }
     }
 
-    #[tool(description = "Get metadata for a file or directory: type, size, hash, permissions.")]
-    async fn stat(
-        &self,
-        Parameters(StatInput { workspace, path }): Parameters<StatInput>,
-    ) -> CallToolResult {
-        let (client, _) = match self.client(&workspace).await {
-            Ok(c) => c,
-            Err(e) => return err(e),
-        };
-        match client.stat(&path).await {
-            Ok(s) => ok_json_in_workspace(&workspace, &s),
-            Err(e) => err(format!("{e}")),
-        }
-    }
-
     #[tool(
-        description = "Write content to a file (full overwrite). Returns operation_id and new hash."
+        description = "Create a new text file atomically. Fails with ALREADY_EXISTS if the path exists: existing files are modified only through edit_file. Returns operation_id and the new hash."
     )]
-    async fn write_file(
+    async fn create_file(
         &self,
-        Parameters(WriteFileInput {
+        Parameters(CreateFileInput {
             workspace,
             path,
             content,
-            base_hash,
-        }): Parameters<WriteFileInput>,
+        }): Parameters<CreateFileInput>,
     ) -> CallToolResult {
         let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
-        match client.write(&path, &content, base_hash.as_deref()).await {
+        match client.create(&path, &content).await {
             Ok(w) => ok(format!(
-                "Wrote {path} in workspace '{workspace}'. operation_id={}, new_hash={}",
+                "Created {path} in workspace '{workspace}'. operation_id={}, new_hash={}",
                 w.operation_id, w.new_hash
             )),
             Err(e) => err(format!("{e}")),
@@ -532,24 +512,35 @@ impl RemoteWorkspaceServer {
     }
 
     #[tool(
-        description = "Apply a line-based patch. Requires base_hash. Format: \"<n>c <text>\", \"<n>d\", \"<n>a <text>\"."
+        description = "Modify an existing text file by exact text replacement, atomically (all or nothing). old_text must match the current content exactly: zero occurrences fail with NO_MATCH, several with AMBIGUOUS_MATCH unless replace_all is set. If the file changed since base_hash the edit fails with STALE_FILE; re-read and retry. Returns operation_id and the new hash."
     )]
-    async fn patch_file(
+    async fn edit_file(
         &self,
-        Parameters(PatchFileInput {
+        Parameters(EditFileInput {
             workspace,
             path,
             base_hash,
-            patch,
-        }): Parameters<PatchFileInput>,
+            old_text,
+            new_text,
+            replace_all,
+        }): Parameters<EditFileInput>,
     ) -> CallToolResult {
         let (client, _) = match self.client(&workspace).await {
             Ok(c) => c,
             Err(e) => return err(e),
         };
-        match client.patch(&path, &base_hash, &patch).await {
+        match client
+            .edit(
+                &path,
+                &base_hash,
+                &old_text,
+                &new_text,
+                replace_all.unwrap_or(false),
+            )
+            .await
+        {
             Ok(w) => ok(format!(
-                "Patched {path} in workspace '{workspace}'. operation_id={}, new_hash={}",
+                "Edited {path} in workspace '{workspace}'. operation_id={}, new_hash={}",
                 w.operation_id, w.new_hash
             )),
             Err(e) => err(format!("{e}")),

@@ -3,10 +3,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OperationKind {
-    Write,
-    Patch,
+    Create,
+    Edit,
     Delete,
     Undo,
+    /// Legacy kinds from the pre-create/edit protocol. No longer produced,
+    /// kept so operation logs written by older servers still deserialize.
+    Write,
+    Patch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +73,9 @@ pub struct ExecOperationRecord {
     pub disposition: ExecDisposition,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub termination: Option<crate::messages::ExecTermination>,
+    /// See `ExecResult::drain_timed_out`.
+    #[serde(default)]
+    pub drain_timed_out: bool,
     pub duration_ms: u64,
     pub timestamp_ms: u64,
     /// Human-readable error message for Rejected/TimedOut execs.

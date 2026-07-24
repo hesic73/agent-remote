@@ -125,10 +125,9 @@ async fn main() -> Result<()> {
     // The first tool call to each workspace connects on demand.
     let server = RemoteWorkspaceServer::new(fleet);
     let service = server
-        .serve(RejectUnknownMethods(AsyncRwTransport::<RoleServer, _, _>::new(
-            tokio::io::stdin(),
-            tokio::io::stdout(),
-        )))
+        .serve(RejectUnknownMethods(
+            AsyncRwTransport::<RoleServer, _, _>::new(tokio::io::stdin(), tokio::io::stdout()),
+        ))
         .await
         .context("failed to start MCP server")?;
     service.waiting().await?;
